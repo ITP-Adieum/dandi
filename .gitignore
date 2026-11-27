@@ -1,0 +1,26 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+*.pdb
+
+# Node / Tauri
+node_modules/
+dist/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# Eval outputs (local scratch)
+eval-report.json
+eval-report.md
+.eval-tmp/
+
+# OS junk
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
