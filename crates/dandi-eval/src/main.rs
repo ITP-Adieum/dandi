@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use serde::Serialize;
 
-use crate::checks::{run_all_checks, CheckResult, EvalContext};
+use crate::checks::{run_all_checks, CheckResult, CheckStatus, EvalContext};
 
 #[derive(Parser)]
 #[command(
@@ -30,7 +30,7 @@ struct Args {
     #[arg(long, default_value = "eval-report.md")]
     md_out: PathBuf,
 
-    /// Minimum passing total score (default 95)
+    /// Minimum passing score percentage over applicable points (default 95)
     #[arg(long, default_value_t = 95)]
     min_score: u32,
 }
@@ -41,7 +41,9 @@ struct EvalReport {
     arch: String,
     remote_windows_enabled: bool,
     total_earned: u32,
+    applicable_max: u32,
     total_max: u32,
+    skipped_count: usize,
     category_scores: BTreeMap<String, CategoryScore>,
     gate_passed: bool,
     checks: Vec<CheckResult>,
@@ -50,7 +52,9 @@ struct EvalReport {
 #[derive(Serialize)]
 struct CategoryScore {
     earned: u32,
+    applicable_max: u32,
     max: u32,
+    skipped: usize,
 }
 
 fn main() -> ExitCode {
@@ -63,34 +67,52 @@ fn main() -> ExitCode {
 
     let mut category_scores: BTreeMap<String, CategoryScore> = BTreeMap::new();
     let mut total_earned = 0u32;
+    let mut applicable_max = 0u32;
     let mut total_max = 0u32;
+    let mut skipped_count = 0usize;
 
     for c in &checks {
-        total_earned += c.earned_points;
         total_max += c.max_points;
         let entry = category_scores
             .entry(c.category.clone())
-            .or_insert(CategoryScore { earned: 0, max: 0 });
-        entry.earned += c.earned_points;
+            .or_insert(CategoryScore {
+                earned: 0,
+                applicable_max: 0,
+                max: 0,
+                skipped: 0,
+            });
         entry.max += c.max_points;
+        if c.status == CheckStatus::Skipped {
+            skipped_count += 1;
+            entry.skipped += 1;
+        } else {
+            total_earned += c.earned_points;
+            applicable_max += c.max_points;
+            entry.earned += c.earned_points;
+            entry.applicable_max += c.max_points;
+        }
     }
 
     let sec_ok = category_scores
         .get("Security")
-        .map(|s| s.earned == s.max)
+        .map(|s| s.skipped == 0 && s.earned == s.max)
         .unwrap_or(false);
     let compat_ok = category_scores
         .get("Compatibility")
-        .map(|s| s.earned == s.max)
+        .map(|s| s.earned == s.applicable_max)
         .unwrap_or(false);
-    let gate_passed = sec_ok && compat_ok && total_earned >= args.min_score;
+    let remote_full_ok = args.windows_ssh.is_none() || skipped_count == 0;
+    let score_ok = applicable_max > 0 && (total_earned * 100) >= (args.min_score * applicable_max);
+    let gate_passed = sec_ok && compat_ok && remote_full_ok && score_ok;
 
     let report = EvalReport {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         remote_windows_enabled: args.windows_ssh.is_some(),
         total_earned,
+        applicable_max,
         total_max,
+        skipped_count,
         category_scores,
         gate_passed,
         checks,
@@ -129,35 +151,37 @@ fn render_markdown(report: &EvalReport) -> String {
         }
     ));
     out.push_str(&format!(
-        "- **Total Score**: **{} / {}** ({})\n\n",
+        "- **Score**: **{} / {}** applicable (out of {} total, {} skipped) — **{}**\n\n",
         report.total_earned,
+        report.applicable_max,
         report.total_max,
+        report.skipped_count,
         if report.gate_passed { "PASS" } else { "FAIL" }
     ));
 
     out.push_str("## Category Breakdown\n\n");
-    out.push_str("| Category | Earned | Max |\n");
-    out.push_str("|---|---:|---:|\n");
+    out.push_str("| Category | Earned | Applicable | Max | Skipped |\n");
+    out.push_str("|---|---:|---:|---:|---:|\n");
     for (cat, score) in &report.category_scores {
-        out.push_str(&format!("| {cat} | {} | {} |\n", score.earned, score.max));
+        out.push_str(&format!(
+            "| {cat} | {} | {} | {} | {} |\n",
+            score.earned, score.applicable_max, score.max, score.skipped
+        ));
     }
 
     out.push_str("\n## Detailed Results\n\n");
     out.push_str("| ID | Category | Test | Score | Status | Time (ms) | Details |\n");
     out.push_str("|---|---|---|---:|---|---:|---|\n");
     for c in &report.checks {
-        let status = if c.passed { "PASS" } else { "FAIL" };
+        let (score_cell, status) = match c.status {
+            CheckStatus::Pass => (format!("{}/{}", c.earned_points, c.max_points), "PASS"),
+            CheckStatus::Fail => (format!("{}/{}", c.earned_points, c.max_points), "FAIL"),
+            CheckStatus::Skipped => (format!("-/{}", c.max_points), "SKIPPED"),
+        };
         let clean_details = c.details.replace('|', "\\|").replace('\n', " ");
         out.push_str(&format!(
-            "| `{}` | {} | {} | {}/{} | {} | {} | {} |\n",
-            c.id,
-            c.category,
-            c.name,
-            c.earned_points,
-            c.max_points,
-            status,
-            c.duration_ms,
-            clean_details
+            "| `{}` | {} | {} | {} | {} | {} | {} |\n",
+            c.id, c.category, c.name, score_cell, status, c.duration_ms, clean_details
         ));
     }
 

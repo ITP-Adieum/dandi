@@ -16,13 +16,14 @@ use zip::write::SimpleFileOptions;
 use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::archive::{
-    check_not_through_archive_symlink, ensure_no_symlink_ancestors, plan_extract_root,
-    synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary, DirCleanupGuard,
-    EntryKind, InspectOptions, PackOptions, PackReport, RepackOptions, RepackReport, UnpackOptions,
-    UnpackReport,
+    check_not_through_archive_symlink, check_symlink_chain_safe, ensure_no_symlink_ancestors,
+    plan_extract_root, synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary,
+    DirCleanupGuard, EntryKind, InspectOptions, PackOptions, PackReport, RepackOptions,
+    RepackReport, UnpackOptions, UnpackReport,
 };
 use crate::codec::{
-    decode_entry_name, detect_archive_encoding, normalize_for_pack, EntryEncodingFlags,
+    decode_entry_name_with_override, detect_archive_encoding, normalize_for_pack, verify_0x7075,
+    EntryEncodingFlags,
 };
 use crate::error::{DandiError, Result};
 use crate::platform::{
@@ -106,11 +107,15 @@ impl RawZipEntryHeader {
             .unwrap_or(false)
     }
 
-    pub fn is_dir(&self) -> bool {
+    /// Determines whether this ZIP entry represents a directory using the *decoded* filename.
+    ///
+    /// Never checks `raw_name.ends_with(b"\\")` on undecoded bytes because Shift_JIS characters
+    /// such as `表`, `能`, and `ソ` legitimately end with trail byte `0x5C`.
+    pub fn is_dir_with_decoded_name(&self, decoded_path: &str) -> bool {
         if self.is_symlink() {
             return false;
         }
-        if self.raw_name.ends_with(b"/") || self.raw_name.ends_with(b"\\") {
+        if decoded_path.ends_with('/') || decoded_path.ends_with('\\') {
             return true;
         }
         if let Some(m) = self.unix_mode() {
@@ -123,6 +128,13 @@ impl RawZipEntryHeader {
 
     pub fn unicode_extra_0x7075(&self) -> Option<&[u8]> {
         find_extra_field(&self.extra_data, 0x7075)
+    }
+
+    /// Returns true only when an Info-ZIP `0x7075` extra field is present AND its CRC32 matches `raw_name`.
+    pub fn has_valid_0x7075(&self) -> bool {
+        self.unicode_extra_0x7075()
+            .and_then(|e| verify_0x7075(&self.raw_name, e))
+            .is_some()
     }
 }
 
@@ -167,7 +179,10 @@ pub(crate) fn read_zip_raw_entries<R: Read + Seek>(
         reader.read_exact(&mut loc)?;
         if read_u32_le(&loc, 0)? == ZIP64_LOCATOR_SIG {
             let z64_offset = read_u64_le(&loc, 8)?;
-            if z64_offset + 56 <= file_len {
+            if z64_offset
+                .checked_add(56)
+                .is_some_and(|end| end <= file_len)
+            {
                 let mut z64 = [0u8; 56];
                 reader.seek(SeekFrom::Start(z64_offset))?;
                 reader.read_exact(&mut z64)?;
@@ -180,7 +195,7 @@ pub(crate) fn read_zip_raw_entries<R: Read + Seek>(
         }
     }
 
-    if total_entries as usize > max_entries {
+    if total_entries > max_entries as u64 {
         return Err(DandiError::BudgetExceeded {
             reason: format!("ZIP declares {total_entries} entries, exceeding limit {max_entries}"),
         });
@@ -449,11 +464,12 @@ pub(crate) fn inspect_zip(archive_path: &Path, opts: &InspectOptions) -> Result<
 
     let non_bit11_names: Vec<&[u8]> = raw_headers
         .iter()
-        .filter(|h| !h.utf8_bit11() && h.unicode_extra_0x7075().is_none())
+        .filter(|h| !h.utf8_bit11() && !h.has_valid_0x7075())
         .map(|h| h.raw_name.as_slice())
         .collect();
     let detection = detect_archive_encoding(&non_bit11_names, opts.locale_hint);
     let applied_encoding = opts.encoding_override.unwrap_or(detection.encoding);
+    let explicit_override = opts.encoding_override.is_some();
 
     let mut entries = Vec::with_capacity(raw_headers.len());
     let mut total_uncompressed = 0u64;
@@ -461,13 +477,14 @@ pub(crate) fn inspect_zip(archive_path: &Path, opts: &InspectOptions) -> Result<
     let mut any_encrypted = false;
 
     for h in &raw_headers {
-        let decoded = decode_entry_name(
+        let decoded = decode_entry_name_with_override(
             &h.raw_name,
             EntryEncodingFlags {
                 utf8_bit11: h.utf8_bit11(),
             },
             h.unicode_extra_0x7075(),
             applied_encoding,
+            explicit_override,
         );
         let junk = is_os_junk(&decoded.path);
         if junk && !opts.include_os_junk {
@@ -475,7 +492,7 @@ pub(crate) fn inspect_zip(archive_path: &Path, opts: &InspectOptions) -> Result<
         }
         let kind = if h.is_symlink() {
             EntryKind::Symlink
-        } else if h.is_dir() {
+        } else if h.is_dir_with_decoded_name(&decoded.path) {
             EntryKind::Directory
         } else {
             EntryKind::File
@@ -656,10 +673,12 @@ fn collect_pack_items(inputs: &[PathBuf], opts: &PackOptions) -> Result<(Vec<Pac
                 junk_skipped += 1;
                 continue;
             }
-            let target = fs::read_link(&fs_input)
+            let target: String = fs::read_link(&fs_input)
                 .map_err(|e| DandiError::io(input, e))?
                 .to_string_lossy()
-                .replace('\\', "/");
+                .replace('\\', "/")
+                .nfc()
+                .collect();
             if seen_names.insert(norm.clone()) {
                 items.push(PackItem {
                     fs_path: input.clone(),
@@ -739,10 +758,12 @@ fn collect_pack_items(inputs: &[PathBuf], opts: &PackOptions) -> Result<(Vec<Pac
 
             let meta = fs::symlink_metadata(path).map_err(|e| DandiError::io(path, e))?;
             if meta.file_type().is_symlink() {
-                let target = fs::read_link(path)
+                let target: String = fs::read_link(path)
                     .map_err(|e| DandiError::io(path, e))?
                     .to_string_lossy()
-                    .replace('\\', "/");
+                    .replace('\\', "/")
+                    .nfc()
+                    .collect();
                 let clean_name = norm.trim_end_matches('/').to_string();
                 if seen_names.insert(clean_name.clone()) {
                     items.push(PackItem {
@@ -1644,16 +1665,21 @@ pub(crate) fn unpack_zip(
 ) -> Result<UnpackReport> {
     opts.cancel.check()?;
     let fs_archive = to_fs_path(archive_path);
+    let archive_file_size = fs::metadata(&fs_archive)
+        .map(|m| m.len())
+        .unwrap_or(1)
+        .max(1);
     let mut raw_file = File::open(&fs_archive).map_err(|e| DandiError::io(archive_path, e))?;
     let raw_headers = read_zip_raw_entries(&mut raw_file, opts.budget.max_entries)?;
 
     let non_bit11_names: Vec<&[u8]> = raw_headers
         .iter()
-        .filter(|h| !h.utf8_bit11() && h.unicode_extra_0x7075().is_none())
+        .filter(|h| !h.utf8_bit11() && !h.has_valid_0x7075())
         .map(|h| h.raw_name.as_slice())
         .collect();
     let detection = detect_archive_encoding(&non_bit11_names, opts.locale_hint);
     let applied_encoding = opts.encoding_override.unwrap_or(detection.encoding);
+    let explicit_override = opts.encoding_override.is_some();
 
     let zone_data = if opts.propagate_zone_identifier {
         read_zone_identifier(archive_path)
@@ -1677,16 +1703,18 @@ pub(crate) fn unpack_zip(
     let mut junk_skipped = 0usize;
     let mut visible_for_smart: Vec<(String, EntryKind)> = Vec::new();
     let mut budget = opts.budget.clone();
+    budget.set_archive_compressed_size(archive_file_size);
 
     for h in &raw_headers {
         opts.cancel.check()?;
-        let decoded = decode_entry_name(
+        let decoded = decode_entry_name_with_override(
             &h.raw_name,
             EntryEncodingFlags {
                 utf8_bit11: h.utf8_bit11(),
             },
             h.unicode_extra_0x7075(),
             applied_encoding,
+            explicit_override,
         );
         let junk = is_os_junk(&decoded.path);
         if opts.exclude_os_junk && junk {
@@ -1701,7 +1729,7 @@ pub(crate) fn unpack_zip(
 
         let kind = if h.is_symlink() {
             EntryKind::Symlink
-        } else if h.is_dir() {
+        } else if h.is_dir_with_decoded_name(&decoded.path) {
             EntryKind::Directory
         } else {
             EntryKind::File
@@ -1760,7 +1788,8 @@ pub(crate) fn unpack_zip(
     let mut symlink_paths_lower: HashSet<String> = HashSet::new();
 
     // Pre-pass: read & validate all symlink entries BEFORE creating any regular files,
-    // so an attack like `out -> /tmp` followed by `out/pwned.txt` is rejected before any write.
+    // blocking absolute targets, root escapes, symlink-ancestor writes, and multi-hop chaining.
+    let mut prevalidated_symlinks: Vec<(PathBuf, String)> = Vec::new();
     for entry in &planned {
         if entry.kind != EntryKind::Symlink {
             continue;
@@ -1784,6 +1813,10 @@ pub(crate) fn unpack_zip(
         })?;
         validate_symlink_target(&plan.extract_root, &final_sanitized.relative, &target)?;
         symlink_paths_lower.insert(final_sanitized.normalized.to_lowercase());
+        prevalidated_symlinks.push((final_sanitized.relative, target));
+    }
+    for (link_rel, target) in &prevalidated_symlinks {
+        check_symlink_chain_safe(link_rel, target, &symlink_paths_lower)?;
     }
 
     let mut read_buf = vec![0u8; STREAM_BUF_SIZE];
@@ -1859,6 +1892,7 @@ pub(crate) fn unpack_zip(
                     entry.encrypted,
                     opts.password.as_deref(),
                 )?;
+                budget.note_live_entry_compressed(entry.compressed_size);
 
                 let fs_out = to_fs_path(&out_path);
                 let out_file = File::create(&fs_out).map_err(|e| DandiError::io(&out_path, e))?;
@@ -1908,6 +1942,8 @@ pub(crate) fn unpack_zip(
     // Phase 2: materialize validated safe relative symlinks.
     for sym in pending_symlinks {
         opts.cancel.check()?;
+        check_symlink_chain_safe(&sym.link_rel, &sym.target, &symlink_paths_lower)?;
+        ensure_no_symlink_ancestors(&plan.extract_root, &sym.link_rel)?;
         let abs_link = plan.extract_root.join(&sym.link_rel);
         if let Some(parent) = abs_link.parent() {
             fs::create_dir_all(to_fs_path(parent)).map_err(|e| DandiError::io(parent, e))?;
@@ -2055,16 +2091,18 @@ pub(crate) fn repack_zip_nfc(
     }
 
     let fs_src = to_fs_path(src_zip);
+    let src_file_size = fs::metadata(&fs_src).map(|m| m.len()).unwrap_or(1).max(1);
     let mut raw_file = File::open(&fs_src).map_err(|e| DandiError::io(src_zip, e))?;
     let raw_headers = read_zip_raw_entries(&mut raw_file, opts.budget.max_entries)?;
 
     let non_bit11: Vec<&[u8]> = raw_headers
         .iter()
-        .filter(|h| !h.utf8_bit11() && h.unicode_extra_0x7075().is_none())
+        .filter(|h| !h.utf8_bit11() && !h.has_valid_0x7075())
         .map(|h| h.raw_name.as_slice())
         .collect();
     let detection = detect_archive_encoding(&non_bit11, opts.locale_hint);
     let source_encoding = opts.encoding_override.unwrap_or(detection.encoding);
+    let explicit_override = opts.encoding_override.is_some();
 
     raw_file.seek(SeekFrom::Start(0))?;
     let mut archive = ZipArchive::new(BufReader::with_capacity(STREAM_BUF_SIZE, raw_file))
@@ -2076,19 +2114,21 @@ pub(crate) fn repack_zip_nfc(
     let mut writer = GoldenZipWriter::new(tmp_file);
 
     let mut budget = opts.budget.clone();
+    budget.set_archive_compressed_size(src_file_size);
     let mut entries_repacked = 0usize;
     let mut junk_skipped = 0usize;
     let total_bytes: u64 = raw_headers.iter().map(|h| h.uncompressed_size).sum();
 
     for h in &raw_headers {
         opts.cancel.check()?;
-        let decoded = decode_entry_name(
+        let decoded = decode_entry_name_with_override(
             &h.raw_name,
             EntryEncodingFlags {
                 utf8_bit11: h.utf8_bit11(),
             },
             h.unicode_extra_0x7075(),
             source_encoding,
+            explicit_override,
         );
         if opts.exclude_os_junk && is_os_junk(&decoded.path) {
             junk_skipped += 1;
@@ -2102,7 +2142,7 @@ pub(crate) fn repack_zip_nfc(
         }
 
         let mtime_secs = h.mtime_unix_secs.unwrap_or_else(current_unix_secs);
-        if h.is_dir() {
+        if h.is_dir_with_decoded_name(&decoded.path) {
             if !clean_name.ends_with('/') {
                 clean_name.push('/');
             }
@@ -2124,6 +2164,7 @@ pub(crate) fn repack_zip_nfc(
                 h.encrypted(),
                 opts.password.as_deref(),
             )?;
+            budget.note_live_entry_compressed(h.compressed_size);
             let mut raw = Vec::new();
             let mut chunk = [0u8; 64 * 1024];
             let mut entry_read = 0u64;

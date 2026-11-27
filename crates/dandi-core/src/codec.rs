@@ -314,7 +314,7 @@ pub fn detect_archive_encoding(
 /// Decodes an archive entry name using the 3-tier priority rule:
 /// 1. Bit 11 UTF-8 flag
 /// 2. Info-ZIP `0x7075` Unicode Path extra field (only if `NameCRC32 == crc32(raw)`)
-/// 3. Valid UTF-8 check (unless an explicit non-UTF-8 encoding is forced on non-ASCII bytes)
+/// 3. Valid UTF-8 check
 /// 4. `forced` / corpus-detected legacy codepage
 ///
 /// Output is always normalized to Unicode NFC.
@@ -323,6 +323,19 @@ pub fn decode_entry_name(
     flags: EntryEncodingFlags,
     unicode_extra_0x7075: Option<&[u8]>,
     forced: EncodingId,
+) -> DecodedName {
+    decode_entry_name_with_override(raw, flags, unicode_extra_0x7075, forced, false)
+}
+
+/// Decodes an archive entry name like [`decode_entry_name`], but when `explicit_override` is
+/// `true` and `forced` is a legacy codepage, honors `forced` even if raw bytes happen to form
+/// valid UTF-8.
+pub fn decode_entry_name_with_override(
+    raw: &[u8],
+    flags: EntryEncodingFlags,
+    unicode_extra_0x7075: Option<&[u8]>,
+    forced: EncodingId,
+    explicit_override: bool,
 ) -> DecodedName {
     if flags.utf8_bit11 {
         if let Ok(s) = std::str::from_utf8(raw) {
@@ -344,12 +357,15 @@ pub fn decode_entry_name(
         }
     }
 
-    if let Ok(s) = std::str::from_utf8(raw) {
-        return DecodedName {
-            path: s.nfc().collect(),
-            source: DecodeSource::ValidUtf8,
-            had_errors: false,
-        };
+    let honor_forced_legacy = explicit_override && forced != EncodingId::Utf8;
+    if !honor_forced_legacy {
+        if let Ok(s) = std::str::from_utf8(raw) {
+            return DecodedName {
+                path: s.nfc().collect(),
+                source: DecodeSource::ValidUtf8,
+                had_errors: false,
+            };
+        }
     }
 
     let (decoded, had_errors) = forced.decode_bytes(raw);
@@ -804,5 +820,32 @@ mod tests {
         );
         assert_eq!(dec2.source, DecodeSource::LegacyCodepage(EncodingId::Cp949));
         assert_eq!(dec2.path, "보고서.txt");
+    }
+
+    #[test]
+    fn explicit_override_honors_legacy_even_on_valid_utf8_bytes() {
+        // 0xC2 0xA1 is valid UTF-8 ("¡") AND valid CP949 ("…")
+        let raw = [0xC2u8, 0xA1];
+        let auto = decode_entry_name_with_override(
+            &raw,
+            EntryEncodingFlags { utf8_bit11: false },
+            None,
+            EncodingId::Cp949,
+            false,
+        );
+        assert_eq!(auto.source, DecodeSource::ValidUtf8);
+
+        let forced = decode_entry_name_with_override(
+            &raw,
+            EntryEncodingFlags { utf8_bit11: false },
+            None,
+            EncodingId::Cp949,
+            true,
+        );
+        assert_eq!(
+            forced.source,
+            DecodeSource::LegacyCodepage(EncodingId::Cp949)
+        );
+        assert_ne!(forced.path, auto.path);
     }
 }

@@ -30,7 +30,7 @@ Every milestone and PR follows this loop:
 1. Plan/Design   → Verify seam & invariants against docs/ARCHITECTURE.md & docs/ISSUE_AUDIT.md
 2. Implement     → Small, cohesive commits; zero clippy warnings; clean rustfmt
 3. Unit + Prop   → cargo test --workspace
-4. Real Eval     → cargo run --release -p dandi-eval -- [--windows-ssh mkt]
+4. Real Eval     → cargo run --release -p dandi-eval -- [--windows-ssh <ssh-alias>]
 5. Inspect Score → Fix every Security/Compat blocker first; improve lowest-scoring rubric items
 6. Cross-Review  → Independent reviewer checks architecture, edge cases, and real eval output
 ```

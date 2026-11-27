@@ -20,10 +20,20 @@ use tempfile::TempDir;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::fixtures::{
-    build_0x7075_block, fill_pseudo_random, hash_directory, sha256_file, sha256_hex,
-    write_7z_fixture, write_raw_zip, write_tar_fixture, RawZipSpec,
+    build_0x7075_block, fill_pseudo_random, generate_realistic_mixed_file, hash_directory,
+    measure_peak_rss_mib, sha256_file, sha256_hex, write_7z_fixture, write_raw_zip,
+    write_tar_fixture, write_tar_gz_zero_bomb, write_tar_with_symlinks, write_zip_zero_bomb,
+    RawZipSpec,
 };
 use crate::windows_bridge::{generate_real_windows_zips, verify_zip_on_windows};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Pass,
+    Fail,
+    Skipped,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckResult {
@@ -32,9 +42,15 @@ pub struct CheckResult {
     pub name: String,
     pub max_points: u32,
     pub earned_points: u32,
+    pub status: CheckStatus,
     pub passed: bool,
     pub duration_ms: u64,
     pub details: String,
+}
+
+enum CheckOutcome {
+    Pass(String),
+    Skipped(String),
 }
 
 #[derive(Clone, Debug)]
@@ -65,14 +81,14 @@ pub fn run_all_checks(ctx: &EvalContext) -> Vec<CheckResult> {
     };
 
     // Category A — Cross-OS Native Compatibility (30 pts)
-    results.push(run_check(
+    results.push(run_check_outcome(
         "COMPAT-01",
         "Compatibility",
         "Mac -> Windows Native Explorer Round-Trip",
         8,
         || check_compat_01(ctx),
     ));
-    results.push(run_check(
+    results.push(run_check_outcome(
         "COMPAT-02",
         "Compatibility",
         "Windows -> Mac Native Archive Utility Round-Trip",
@@ -270,15 +286,36 @@ fn run_check<F>(id: &str, category: &str, name: &str, max_points: u32, f: F) -> 
 where
     F: FnOnce() -> Result<String, String>,
 {
+    run_check_outcome(id, category, name, max_points, || {
+        f().map(CheckOutcome::Pass)
+    })
+}
+
+fn run_check_outcome<F>(id: &str, category: &str, name: &str, max_points: u32, f: F) -> CheckResult
+where
+    F: FnOnce() -> Result<CheckOutcome, String>,
+{
     let start = Instant::now();
     match f() {
-        Ok(details) => CheckResult {
+        Ok(CheckOutcome::Pass(details)) => CheckResult {
             id: id.to_string(),
             category: category.to_string(),
             name: name.to_string(),
             max_points,
             earned_points: max_points,
+            status: CheckStatus::Pass,
             passed: true,
+            duration_ms: start.elapsed().as_millis() as u64,
+            details,
+        },
+        Ok(CheckOutcome::Skipped(details)) => CheckResult {
+            id: id.to_string(),
+            category: category.to_string(),
+            name: name.to_string(),
+            max_points,
+            earned_points: 0,
+            status: CheckStatus::Skipped,
+            passed: false,
             duration_ms: start.elapsed().as_millis() as u64,
             details,
         },
@@ -288,6 +325,7 @@ where
             name: name.to_string(),
             max_points,
             earned_points: 0,
+            status: CheckStatus::Fail,
             passed: false,
             duration_ms: start.elapsed().as_millis() as u64,
             details: err,
@@ -301,7 +339,7 @@ type WinGenTriple = (
     Result<crate::windows_bridge::WinGeneratedArchive, String>,
 );
 
-fn check_compat_01(ctx: &EvalContext) -> Result<String, String> {
+fn check_compat_01(ctx: &EvalContext) -> Result<CheckOutcome, String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let root_name_nfc = "단디_호환성_테스트";
     let root_name_nfd: String = root_name_nfc.nfd().collect();
@@ -426,39 +464,22 @@ fn check_compat_01(ctx: &EvalContext) -> Result<String, String> {
         } else {
             "native Windows"
         };
-        Ok(format!(
+        Ok(CheckOutcome::Pass(format!(
             "verified {} NFC files via Explorer COM + Expand-Archive ({via}), {} junk skipped",
             expected_hashes.len(),
             report.junk_skipped
-        ))
+        )))
     } else {
-        // Local verification on macOS/Linux without remote Windows target.
-        let out = tmp.path().join("local_out");
-        let urep = unpack(
-            &zip_path,
-            &out,
-            &UnpackOptions::default(),
-            &NoopProgressObserver,
-        )
-        .map_err(|e| e.to_string())?;
-        let actual = hash_directory(&out)?;
-        for (rel, exp_hash) in &expected_hashes {
-            let got = actual
-                .get(rel)
-                .ok_or_else(|| format!("missing unpacked file '{rel}'"))?;
-            if got != exp_hash {
-                return Err(format!("SHA-256 mismatch for '{rel}'"));
-            }
-        }
-        Ok(format!(
-            "verified {} NFC files & raw Golden ZIP headers locally ({} extracted; pass --windows-ssh for remote Explorer COM check)",
+        // Do NOT award full COMPAT-01 points via self-unpack when no real Windows target is available.
+        Ok(CheckOutcome::Skipped(format!(
+            "SKIPPED: no native Windows or --windows-ssh host (raw Golden ZIP headers verified for {} files, {} junk skipped)",
             expected_hashes.len(),
-            urep.files_extracted
-        ))
+            report.junk_skipped
+        )))
     }
 }
 
-fn check_compat_02(win_gen: Option<&WinGenTriple>) -> Result<String, String> {
+fn check_compat_02(win_gen: Option<&WinGenTriple>) -> Result<CheckOutcome, String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let src_dir = tmp.path().join("win_roundtrip");
     fs::create_dir_all(src_dir.join("sub")).map_err(|e| e.to_string())?;
@@ -571,27 +592,16 @@ fn check_compat_02(win_gen: Option<&WinGenTriple>) -> Result<String, String> {
     }
 
     if verified_tools.is_empty() {
-        // Fallback on Linux/Windows without macOS ditto
-        let out = tmp.path().join("dandi_unpack");
-        unpack(
-            &dandi_zip,
-            &out,
-            &UnpackOptions::default(),
-            &NoopProgressObserver,
-        )
-        .map_err(|e| e.to_string())?;
-        let h1 = sha256_file(&out.join("win_roundtrip/readme.txt"))?;
-        let h2 = sha256_file(&out.join("win_roundtrip/sub/한글_문서.txt"))?;
-        if h1 != sha256_hex(f1) || h2 != sha256_hex(f2) {
-            return Err("dandi unpack SHA-256 mismatch".to_string());
-        }
-        verified_tools.push("dandi roundtrip + raw header audit");
+        // Do NOT award COMPAT-02 points via self-unpack when neither macOS ditto/unzip nor Windows PowerShell is available.
+        return Ok(CheckOutcome::Skipped(
+            "SKIPPED: no macOS ditto/unzip or Windows PowerShell host (raw Bit-11 / no-0x7075 headers verified)".to_string(),
+        ));
     }
 
-    Ok(format!(
+    Ok(CheckOutcome::Pass(format!(
         "verified via [{}], Bit 11 ON, 0 redundant 0x7075",
         verified_tools.join(", ")
-    ))
+    )))
 }
 
 fn check_compat_03() -> Result<String, String> {
@@ -1111,19 +1121,22 @@ fn check_i18n_03() -> Result<String, String> {
         ("日本語/一覧表_機能一覧.txt", b"sjis-1".as_slice()),
         ("日本語/ソフト設計書/能力確認.md", b"sjis-2".as_slice()),
         ("日本語/予定表_ソース.txt", b"sjis-3".as_slice()),
+        // Extensionless Shift_JIS filenames ending in 0x5C trail byte (must NOT be misclassified as directories!)
+        ("日本語/一覧表", b"sjis-trailing-5c-hyou".as_slice()),
+        ("日本語/機能", b"sjis-trailing-5c-nou".as_slice()),
+        ("日本語/ソ", b"sjis-trailing-5c-so".as_slice()),
     ];
     let specs: Vec<RawZipSpec> = expected
         .iter()
         .map(|(name, data)| {
             let (raw, had_err) = EncodingId::ShiftJis.encode_str(name);
             assert!(!had_err);
-            // Sanity check that our test genuinely exercises Shift_JIS 0x5C trail bytes!
             RawZipSpec::file(raw, data.to_vec())
         })
         .collect();
-    let has_5c = specs.iter().any(|s| s.raw_name.contains(&0x5C));
-    if !has_5c {
-        return Err("Shift_JIS fixture failed to include 0x5C trail bytes".to_string());
+    let has_trailing_5c = specs.iter().any(|s| s.raw_name.ends_with(&[0x5C]));
+    if !has_trailing_5c {
+        return Err("Shift_JIS fixture failed to include trailing 0x5C trail bytes".to_string());
     }
 
     let zip_path = tmp.path().join("legacy_sjis.zip");
@@ -1135,6 +1148,19 @@ fn check_i18n_03() -> Result<String, String> {
             "Shift_JIS detected as {:?}",
             summary.applied_encoding
         ));
+    }
+    for (name, _) in &expected {
+        let entry = summary
+            .entries
+            .iter()
+            .find(|e| e.path == *name)
+            .ok_or_else(|| format!("inspect missing Shift_JIS entry '{name}'"))?;
+        if entry.kind != EntryKind::File {
+            return Err(format!(
+                "Shift_JIS entry '{name}' misclassified as {:?}",
+                entry.kind
+            ));
+        }
     }
 
     let out = tmp.path().join("out");
@@ -1152,8 +1178,33 @@ fn check_i18n_03() -> Result<String, String> {
         }
     }
 
+    // Verify repack_nfc also preserves extensionless 0x5C Shift_JIS files as regular files with intact bytes.
+    let repacked = tmp.path().join("repacked_sjis.zip");
+    repack_nfc(
+        &zip_path,
+        &repacked,
+        &RepackOptions::default(),
+        &NoopProgressObserver,
+    )
+    .map_err(|e| e.to_string())?;
+    let repacked_out = tmp.path().join("out_repacked");
+    unpack(
+        &repacked,
+        &repacked_out,
+        &UnpackOptions::default(),
+        &NoopProgressObserver,
+    )
+    .map_err(|e| e.to_string())?;
+    for (name, data) in expected {
+        let got = fs::read(repacked_out.join(name))
+            .map_err(|e| format!("repacked missing {name}: {e}"))?;
+        if got != data {
+            return Err(format!("repacked content mismatch for {name}"));
+        }
+    }
+
     Ok(
-        "Shift_JIS auto-detected; 表/能/ソ 0x5C trail bytes preserved without path splitting"
+        "Shift_JIS auto-detected; 表/能/ソ & extensionless trailing-0x5C files preserved across unpack & repack_nfc"
             .to_string(),
     )
 }
@@ -1386,8 +1437,8 @@ fn check_i18n_07() -> Result<String, String> {
 
 fn check_i18n_08() -> Result<String, String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
-    let raw1 = EncodingId::Cp949.encode_str("구형_이름.txt").0;
-    let raw2 = EncodingId::Cp949.encode_str("변조_이름.txt").0;
+    let raw1 = EncodingId::Cp949.encode_str("구형_보고서_파일.txt").0;
+    let raw2 = EncodingId::Cp949.encode_str("변조_보고서_회의록.txt").0;
 
     let mut e1 = RawZipSpec::file(raw1.clone(), b"valid-7075".to_vec());
     e1.extra = build_0x7075_block(&raw1, "유니코드_정상.txt", false);
@@ -1398,23 +1449,24 @@ fn check_i18n_08() -> Result<String, String> {
     let zip_path = tmp.path().join("extra7075.zip");
     write_raw_zip(&zip_path, &[e1, e2])?;
 
-    let summary = inspect(
-        &zip_path,
-        &InspectOptions {
-            encoding_override: Some(EncodingId::Cp949),
-            ..InspectOptions::default()
-        },
-    )
-    .map_err(|e| e.to_string())?;
+    // Inspect WITHOUT encoding_override so the tampered 0x7075 entry MUST still enter corpus auto-detection!
+    let summary = inspect(&zip_path, &InspectOptions::default()).map_err(|e| e.to_string())?;
+    if summary.applied_encoding != EncodingId::Cp949 {
+        return Err(format!(
+            "tampered 0x7075 entry was not auto-detected as CP949 (got {:?})",
+            summary.applied_encoding
+        ));
+    }
     let paths: Vec<&str> = summary.entries.iter().map(|e| e.path.as_str()).collect();
     if !paths.contains(&"유니코드_정상.txt") {
         return Err(format!("valid 0x7075 not honored: {paths:?}"));
     }
-    if paths.contains(&"위조된_이름.txt") || !paths.contains(&"변조_이름.txt") {
+    if paths.contains(&"위조된_이름.txt") || !paths.contains(&"변조_보고서_회의록.txt")
+    {
         return Err(format!("tampered 0x7075 was not safely ignored: {paths:?}"));
     }
 
-    Ok("valid 0x7075 honored; tampered CRC32 safely ignored".to_string())
+    Ok("valid 0x7075 honored; tampered CRC32 safely ignored & auto-detected as CP949 without override".to_string())
 }
 
 fn check_sec_01() -> Result<String, String> {
@@ -1505,41 +1557,125 @@ fn check_sec_02() -> Result<String, String> {
         return Err(format!("relative symlink escape not rejected: {r3:?}"));
     }
 
-    Ok("all symlink escape & absolute symlink attacks rejected with UnsafeSymlink".to_string())
+    // Attack 4 (ZIP): 2-entry symlink chaining (`sub/up -> ..` + `sub/up/escape -> ../outside`)
+    let zip4 = tmp.path().join("sym_chain.zip");
+    let sc1 = RawZipSpec::symlink(b"sub/up".to_vec(), "..");
+    let sc2 = RawZipSpec::symlink(b"sub/up/escape".to_vec(), "../outside");
+    write_raw_zip(&zip4, &[sc1, sc2])?;
+    let r4 = unpack(
+        &zip4,
+        &tmp.path().join("d4"),
+        &UnpackOptions::default(),
+        &NoopProgressObserver,
+    );
+    if !matches!(r4, Err(DandiError::UnsafeSymlink { .. })) {
+        return Err(format!("ZIP symlink chaining attack not rejected: {r4:?}"));
+    }
+
+    // Attack 5 (TAR): 2-entry symlink chaining (`sub/up -> ..` + `sub/up/escape -> ../outside`)
+    let tar5 = tmp.path().join("sym_chain.tar.gz");
+    write_tar_with_symlinks(
+        &tar5,
+        true,
+        &[
+            ("sub/up", Some(".."), b""),
+            ("sub/up/escape", Some("../outside"), b""),
+        ],
+    )?;
+    let r5 = unpack(
+        &tar5,
+        &tmp.path().join("d5"),
+        &UnpackOptions::default(),
+        &NoopProgressObserver,
+    );
+    if !matches!(r5, Err(DandiError::UnsafeSymlink { .. })) {
+        return Err(format!("TAR symlink chaining attack not rejected: {r5:?}"));
+    }
+
+    Ok("all symlink escape, absolute symlink & ZIP/TAR symlink-chaining attacks rejected with UnsafeSymlink".to_string())
 }
 
 fn check_sec_03() -> Result<String, String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
-    // 100 MB all-zeros compresses to ~100 KB (~1000x ratio)
-    let bomb_data = vec![0u8; 100 * 1024 * 1024];
-    let mut spec = RawZipSpec::file(b"bomb.bin".to_vec(), bomb_data);
-    spec.flags = 0x0800;
-    let bomb_zip = tmp.path().join("bomb.zip");
-    write_raw_zip(&bomb_zip, &[spec])?;
-
-    let dest = tmp.path().join("bomb_out");
     let tight_budget = SafetyBudget::new(20 * 1024 * 1024, 1000, 100.0, 5 * 1024 * 1024);
 
+    // 1. Single-entry 100 MB all-zeros ZIP bomb (~100 KB compressed, streamed to disk without 100 MB RAM alloc)
+    let bomb_zip = tmp.path().join("bomb.zip");
+    write_zip_zero_bomb(&bomb_zip, "bomb.bin", 100 * 1024 * 1024)?;
+    let dest = tmp.path().join("bomb_out");
     let res = unpack(
         &bomb_zip,
         &dest,
         &UnpackOptions {
-            budget: tight_budget,
+            budget: tight_budget.clone(),
             ..UnpackOptions::default()
         },
         &NoopProgressObserver,
     );
     if !matches!(res, Err(DandiError::BudgetExceeded { .. })) {
         return Err(format!(
-            "Zip Bomb was NOT rejected with BudgetExceeded: {res:?}"
+            "single-entry Zip Bomb was NOT rejected with BudgetExceeded: {res:?}"
         ));
     }
     if dest.exists() {
         return Err("partial output directory was not cleaned up after BudgetExceeded".to_string());
     }
 
+    // 2. Multi-file small-entry ZIP bomb (30 x 1 MiB zeros = 30 MiB @ ~1000x aggregate ratio, each < 5 MiB threshold)
+    let one_mib_zeros = vec![0u8; 1024 * 1024];
+    let multi_specs: Vec<RawZipSpec> = (0..30)
+        .map(|i| {
+            let mut s =
+                RawZipSpec::file(format!("z_{i:02}.bin").into_bytes(), one_mib_zeros.clone());
+            s.flags = 0x0800;
+            s
+        })
+        .collect();
+    let multi_zip = tmp.path().join("multi_bomb.zip");
+    write_raw_zip(&multi_zip, &multi_specs)?;
+    let multi_dest = tmp.path().join("multi_bomb_out");
+    let res_multi = unpack(
+        &multi_zip,
+        &multi_dest,
+        &UnpackOptions {
+            budget: SafetyBudget::new(100 * 1024 * 1024, 1000, 100.0, 5 * 1024 * 1024),
+            ..UnpackOptions::default()
+        },
+        &NoopProgressObserver,
+    );
+    if !matches!(res_multi, Err(DandiError::BudgetExceeded { .. })) {
+        return Err(format!(
+            "multi-file small-entry ZIP bomb bypassed aggregate ratio budget: {res_multi:?}"
+        ));
+    }
+    if multi_dest.exists() {
+        return Err("partial output directory remained after multi-file ZIP bomb".to_string());
+    }
+
+    // 3. .tar.gz decompression stream bomb (50 MiB zeros compressed to ~50 KB)
+    let tar_bomb = tmp.path().join("tar_bomb.tar.gz");
+    write_tar_gz_zero_bomb(&tar_bomb, 50 * 1024 * 1024)?;
+    let tar_dest = tmp.path().join("tar_bomb_out");
+    let res_tar = unpack(
+        &tar_bomb,
+        &tar_dest,
+        &UnpackOptions {
+            budget: tight_budget,
+            ..UnpackOptions::default()
+        },
+        &NoopProgressObserver,
+    );
+    if !matches!(res_tar, Err(DandiError::BudgetExceeded { .. })) {
+        return Err(format!(
+            ".tar.gz decompression bomb was NOT rejected with BudgetExceeded: {res_tar:?}"
+        ));
+    }
+    if tar_dest.exists() {
+        return Err("partial output directory remained after .tar.gz bomb".to_string());
+    }
+
     Ok(
-        "100 MB (~1000x) Zip Bomb blocked with BudgetExceeded & partial output cleaned up"
+        "single-entry 100 MB ZIP bomb, multi-file aggregate ZIP bomb & 50 MB .tar.gz stream bomb all blocked with BudgetExceeded"
             .to_string(),
     )
 }
@@ -1705,37 +1841,31 @@ fn check_perf_01() -> Result<String, String> {
     let src_dir = tmp.path().join("perf_text");
     fs::create_dir_all(&src_dir).map_err(|e| e.to_string())?;
 
-    // 200 mixed text/JSON/code files totaling ~50 MB (250 KB each).
+    // 200 realistic medium-entropy mixed JSON/code/log files totaling ~50 MB (250 KB each, ~3-5x Deflate ratio).
     let file_count = 200usize;
     let target_per_file = 250_000usize;
     let mut total_bytes = 0u64;
-    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(file_count);
+    let mut file_paths = Vec::with_capacity(file_count);
 
     for i in 0..file_count {
-        let mut buf = Vec::with_capacity(target_per_file + 512);
-        let mut line_idx = 0usize;
-        while buf.len() < target_per_file {
-            let line = format!(
-                "{{\"id\":{i},\"row\":{line_idx},\"module\":\"dandi_core::archive::zip_io\",\"status\":\"ok\",\"msg\":\"cross-os NFC filename encoding & parallel deflate benchmark\"}}\n"
-            );
-            buf.extend_from_slice(line.as_bytes());
-            line_idx += 1;
-        }
+        let buf = generate_realistic_mixed_file(i, target_per_file);
         let ext = match i % 3 {
             0 => "json",
             1 => "rs",
             _ => "txt",
         };
-        fs::write(src_dir.join(format!("mod_{i:03}.{ext}")), &buf).map_err(|e| e.to_string())?;
+        let p = src_dir.join(format!("mod_{i:03}.{ext}"));
+        fs::write(&p, &buf).map_err(|e| e.to_string())?;
         total_bytes += buf.len() as u64;
-        samples.push(buf);
+        file_paths.push(p);
     }
 
-    // Single-threaded Deflate baseline (level 6).
+    // Single-threaded Deflate baseline (level 6, reading from disk to match pack_zip apples-to-apples).
     let t_base = Instant::now();
-    for data in &samples {
+    for p in &file_paths {
+        let data = fs::read(p).map_err(|e| e.to_string())?;
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(6));
-        enc.write_all(data).map_err(|e| e.to_string())?;
+        enc.write_all(&data).map_err(|e| e.to_string())?;
         let _ = enc.finish().map_err(|e| e.to_string())?;
     }
     let base_secs = t_base.elapsed().as_secs_f64().max(1e-6);
@@ -1761,6 +1891,13 @@ fn check_perf_01() -> Result<String, String> {
         ));
     }
 
+    let ratio = (total_bytes as f64) / (prep.output_bytes.max(1) as f64);
+    if !(2.0..=8.0).contains(&ratio) {
+        return Err(format!(
+            "PERF-01 fixture compression ratio {ratio:.2}x is outside realistic 2x..8x range"
+        ));
+    }
+
     if par_mb_s < 80.0 {
         return Err(format!(
             "parallel deflate throughput {par_mb_s:.1} MB/s < 80.0 MB/s (single-thread baseline: {base_mb_s:.1} MB/s)"
@@ -1773,7 +1910,7 @@ fn check_perf_01() -> Result<String, String> {
     }
 
     Ok(format!(
-        "{par_mb_s:.1} MB/s parallel vs {base_mb_s:.1} MB/s single-thread ({:.2}x speedup, {:.1} MB -> {:.1} MB)",
+        "{par_mb_s:.1} MB/s parallel vs {base_mb_s:.1} MB/s single-thread ({:.2}x speedup, {:.1} MB -> {:.1} MB, {ratio:.2}x ratio)",
         par_mb_s / base_mb_s,
         total_bytes as f64 / 1_000_000.0,
         prep.output_bytes as f64 / 1_000_000.0
@@ -1842,17 +1979,16 @@ fn check_perf_03() -> Result<String, String> {
     let src_dir = tmp.path().join("unpack_bench");
     fs::create_dir_all(&src_dir).map_err(|e| e.to_string())?;
 
-    // 50 MB across 50 files of mixed compressible data.
+    // 50 MB across 50 realistic medium-entropy files (~3-5x Deflate compression ratio).
     let mut total_bytes = 0u64;
-    let unit = b"Dandi streaming extraction throughput benchmark line 0123456789abcdef\n";
-    let one_mb: Vec<u8> = unit.iter().copied().cycle().take(1_000_000).collect();
     for i in 0..50usize {
-        fs::write(src_dir.join(format!("chunk_{i:02}.log")), &one_mb).map_err(|e| e.to_string())?;
-        total_bytes += one_mb.len() as u64;
+        let data = generate_realistic_mixed_file(1000 + i, 1_000_000);
+        fs::write(src_dir.join(format!("chunk_{i:02}.log")), &data).map_err(|e| e.to_string())?;
+        total_bytes += data.len() as u64;
     }
 
     let zip_path = tmp.path().join("bench50.zip");
-    pack(
+    let prep = pack(
         &[src_dir],
         &zip_path,
         &PackOptions::default(),
@@ -1882,8 +2018,17 @@ fn check_perf_03() -> Result<String, String> {
         return Err(format!("extraction throughput {mb_s:.1} MB/s < 150.0 MB/s"));
     }
 
+    let peak_rss_mib =
+        measure_peak_rss_mib().ok_or_else(|| "failed to measure process peak RSS".to_string())?;
+    if peak_rss_mib > 256.0 {
+        return Err(format!(
+            "process peak RSS {peak_rss_mib:.1} MiB exceeded 256 MiB streaming bound"
+        ));
+    }
+
+    let ratio = (total_bytes as f64) / (prep.output_bytes.max(1) as f64);
     Ok(format!(
-        "streaming unpack {mb_s:.1} MB/s (50 MB across 50 files, bounded 256 KiB I/O buffers)"
+        "streaming unpack {mb_s:.1} MB/s (50 MB @ {ratio:.2}x ratio, measured peak RSS {peak_rss_mib:.1} MiB)"
     ))
 }
 

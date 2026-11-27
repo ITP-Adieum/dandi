@@ -320,6 +320,307 @@ pub fn hash_directory(root: &Path) -> Result<BTreeMap<String, String>, String> {
     Ok(map)
 }
 
+/// Builds a `.tar` or `.tar.gz` fixture containing symlinks and/or regular files.
+pub fn write_tar_with_symlinks(
+    path: &Path,
+    gzip: bool,
+    entries: &[(&str, Option<&str>, &[u8])],
+) -> Result<(), String> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        for (name, sym_target, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mtime(1_735_689_600);
+            if let Some(target) = sym_target {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_cksum();
+                builder
+                    .append_link(&mut header, name, target)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, *data)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        builder.finish().map_err(|e| e.to_string())?;
+    }
+
+    let file = File::create(path).map_err(|e| e.to_string())?;
+    if gzip {
+        let mut enc = GzEncoder::new(file, Compression::default());
+        enc.write_all(&tar_bytes).map_err(|e| e.to_string())?;
+        enc.finish().map_err(|e| e.to_string())?;
+    } else {
+        let mut f = file;
+        f.write_all(&tar_bytes).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Streams a zero-filled `.tar.gz` decompression bomb directly to disk without buffering it in RAM.
+pub fn write_tar_gz_zero_bomb(path: &Path, payload_bytes: u64) -> Result<(), String> {
+    let file = File::create(path).map_err(|e| e.to_string())?;
+    let gz = GzEncoder::new(file, Compression::fast());
+    let mut builder = tar::Builder::new(gz);
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(payload_bytes);
+    header.set_mode(0o644);
+    header.set_mtime(1_735_689_600);
+    header.set_cksum();
+    let zero_reader = std::io::repeat(0u8).take(payload_bytes);
+    builder
+        .append_data(&mut header, "tar_bomb.bin", zero_reader)
+        .map_err(|e| e.to_string())?;
+    let gz = builder.into_inner().map_err(|e| e.to_string())?;
+    gz.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Streams a zero-filled single-entry ZIP bomb directly to disk without allocating `uncomp_bytes` in RAM.
+pub fn write_zip_zero_bomb(path: &Path, entry_name: &str, uncomp_bytes: u64) -> Result<(), String> {
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+    let zeros = vec![0u8; 256 * 1024];
+    let mut crc = crc32fast::Hasher::new();
+    let mut rem = uncomp_bytes;
+    while rem > 0 {
+        let take = (rem as usize).min(zeros.len());
+        crc.update(&zeros[..take]);
+        enc.write_all(&zeros[..take]).map_err(|e| e.to_string())?;
+        rem -= take as u64;
+    }
+    let comp = enc.finish().map_err(|e| e.to_string())?;
+    let crc_val = crc.finalize();
+    let comp_len = comp.len() as u32;
+    let uncomp_len = uncomp_bytes as u32;
+    let raw_name = entry_name.as_bytes();
+
+    let mut out = Vec::with_capacity(comp.len() + 256);
+    out.extend_from_slice(&LFH_SIG.to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&0x0800u16.to_le_bytes());
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&((2026 - 1980) << 9 | (1 << 5) | 1u16).to_le_bytes());
+    out.extend_from_slice(&crc_val.to_le_bytes());
+    out.extend_from_slice(&comp_len.to_le_bytes());
+    out.extend_from_slice(&uncomp_len.to_le_bytes());
+    out.extend_from_slice(&(raw_name.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(raw_name);
+    out.extend_from_slice(&comp);
+
+    let cd_offset = out.len() as u32;
+    out.extend_from_slice(&CDH_SIG.to_le_bytes());
+    out.extend_from_slice(&((3u16 << 8) | 20).to_le_bytes());
+    out.extend_from_slice(&20u16.to_le_bytes());
+    out.extend_from_slice(&0x0800u16.to_le_bytes());
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&((2026 - 1980) << 9 | (1 << 5) | 1u16).to_le_bytes());
+    out.extend_from_slice(&crc_val.to_le_bytes());
+    out.extend_from_slice(&comp_len.to_le_bytes());
+    out.extend_from_slice(&uncomp_len.to_le_bytes());
+    out.extend_from_slice(&(raw_name.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(raw_name);
+
+    let cd_size = (out.len() as u32) - cd_offset;
+    out.extend_from_slice(&EOCD_SIG.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+
+    fs::write(path, out).map_err(|e| e.to_string())
+}
+
+/// Generates realistic medium-entropy mixed JSON/code/prose bytes (~3-5x Deflate ratio).
+pub fn generate_realistic_mixed_file(file_idx: usize, target_len: usize) -> Vec<u8> {
+    const WORDS: &[&str] = &[
+        "archive",
+        "header",
+        "central",
+        "directory",
+        "unicode",
+        "normalize",
+        "filename",
+        "platform",
+        "windows",
+        "macos",
+        "linux",
+        "stream",
+        "deflate",
+        "checksum",
+        "payload",
+        "offset",
+        "timestamp",
+        "extended",
+        "symlink",
+        "sandbox",
+        "budget",
+        "collision",
+        "tracker",
+        "encoder",
+        "decoder",
+        "charset",
+        "korean",
+        "japanese",
+        "chinese",
+        "cyrillic",
+        "latin",
+        "pipeline",
+        "parallel",
+        "worker",
+        "observer",
+        "progress",
+        "cancel",
+        "rollback",
+        "atomic",
+        "temp",
+        "verify",
+        "digest",
+        "extract",
+        "compress",
+        "storage",
+        "metadata",
+        "segment",
+        "policy",
+        "compat",
+        "security",
+        "throughput",
+        "latency",
+        "memory",
+        "buffer",
+        "chunk",
+        "record",
+        "schema",
+        "index",
+        "entry",
+        "folder",
+        "bundle",
+        "artifact",
+        "release",
+        "audit",
+    ];
+    let mut state: u64 = (file_idx as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0xD1B5_4A32_D192_ED03);
+    let mut next_u64 = || -> u64 {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    let mut out = Vec::with_capacity(target_len + 256);
+    let mut row = 0u64;
+    while out.len() < target_len {
+        let r1 = next_u64();
+        let r2 = next_u64();
+        let w0 = WORDS[(r1 as usize) % WORDS.len()];
+        let w1 = WORDS[((r1 >> 8) as usize) % WORDS.len()];
+        let w2 = WORDS[((r1 >> 16) as usize) % WORDS.len()];
+        let w3 = WORDS[((r1 >> 24) as usize) % WORDS.len()];
+        let w4 = WORDS[((r2) as usize) % WORDS.len()];
+        let w5 = WORDS[((r2 >> 8) as usize) % WORDS.len()];
+        let hash_part = (r1 ^ r2) & 0xFFFF_FFFF;
+        let line = match (file_idx + row as usize) % 3 {
+            0 => format!(
+                "{{\"seq\":{row},\"mod\":\"{w0}::{w1}\",\"tag\":\"{w2}-{w3}\",\"tok\":\"{hash_part:08x}\",\"note\":\"{w4} {w5} {}\"}}\n",
+                (r2 >> 32) % 999_983
+            ),
+            1 => format!(
+                "pub fn {w0}_{w1}_{row}(ctx: &{w2}) -> Result<{w3}> {{ check_{w4}(ctx, 0x{hash_part:08x}, \"{w5}\") }}\n"
+            ),
+            _ => format!(
+                "[{row:05}] {w0}/{w1}/{w2}.rs: {w3} {w4} {w5} id={hash_part:08x} dt={}us\n",
+                (r1 >> 40) % 50_000
+            ),
+        };
+        out.extend_from_slice(line.as_bytes());
+        row += 1;
+    }
+    out.truncate(target_len);
+    out
+}
+
+/// Measures actual OS peak RSS of the current process in MiB.
+pub fn measure_peak_rss_mib() -> Option<f64> {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        let max_rss = usage.ru_maxrss as f64;
+        // macOS reports ru_maxrss in bytes; Linux reports KiB.
+        #[cfg(target_os = "macos")]
+        {
+            Some(max_rss / (1024.0 * 1024.0))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(max_rss / 1024.0)
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut std::ffi::c_void,
+                ppsmem_counters: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut counters = std::mem::MaybeUninit::<ProcessMemoryCounters>::zeroed();
+        let cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+        let ok = unsafe {
+            (*counters.as_mut_ptr()).cb = cb;
+            K32GetProcessMemoryInfo(GetCurrentProcess(), counters.as_mut_ptr(), cb)
+        };
+        if ok == 0 {
+            return None;
+        }
+        let counters = unsafe { counters.assume_init() };
+        Some((counters.peak_working_set_size as f64) / (1024.0 * 1024.0))
+    }
+}
+
 /// Deterministic fast PRNG for generating incompressible random-entropy media fixtures.
 pub fn fill_pseudo_random(len: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; len];

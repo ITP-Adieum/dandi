@@ -14,7 +14,7 @@
         │
         ├──► Local OS Native Checks (macOS: ditto, unzip / Windows: Expand-Archive, Explorer COM, tar.exe)
         │
-        ├──► Remote Real-Windows Round-Trip (--windows-ssh <host>, e.g. mkt ko-KR Windows 10)
+        ├──► Remote Real-Windows Round-Trip (--windows-ssh <host>, e.g. a real ko-KR Windows host)
         │      • Mac dandi pack → SCP to Windows → Extract with REAL Windows Explorer COM + PowerShell
         │      • Verify exact NFC filenames, SHA-256 bytes, timestamps, 0 junk files
         │      • Generate REAL Korean CP949 & Windows ZIP on Windows → SCP to Mac → Mac dandi unpack → verify 0 mojibake

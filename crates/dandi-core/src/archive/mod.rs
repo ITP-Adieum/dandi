@@ -460,7 +460,7 @@ pub(crate) fn ensure_no_symlink_ancestors(root: &Path, rel: &Path) -> Result<()>
     Ok(())
 }
 
-/// Checks if any prefix of `normalized` matches a symlink declared earlier in the archive.
+/// Checks if any prefix of `normalized` matches a symlink declared in the archive.
 pub(crate) fn check_not_through_archive_symlink(
     normalized: &str,
     symlink_paths_lower: &HashSet<String>,
@@ -477,6 +477,47 @@ pub(crate) fn check_not_through_archive_symlink(
                 path: normalized.to_string(),
                 target: prefix,
                 reason: "entry attempts to write through a symlink path in the archive".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks that a symlink's own strict ancestor paths AND its lexically traversed target path
+/// do not pass through any archive-declared symlink (blocks multi-hop symlink chaining).
+pub(crate) fn check_symlink_chain_safe(
+    link_rel: &Path,
+    target: &str,
+    symlink_paths_lower: &HashSet<String>,
+) -> Result<()> {
+    let link_norm = link_rel.to_string_lossy().replace('\\', "/");
+    let parts: Vec<&str> = link_norm.split('/').collect();
+    if parts.len() > 1 {
+        let mut prefix = String::new();
+        for (idx, part) in parts[..parts.len() - 1].iter().enumerate() {
+            if idx > 0 {
+                prefix.push('/');
+            }
+            prefix.push_str(&part.to_lowercase());
+            if symlink_paths_lower.contains(&prefix) {
+                return Err(DandiError::UnsafeSymlink {
+                    path: link_norm,
+                    target: target.to_string(),
+                    reason: format!(
+                        "symlink ancestor '{prefix}' is itself a symlink in the archive"
+                    ),
+                });
+            }
+        }
+    }
+
+    let (_resolved, traversed_lower) = crate::safety::resolve_symlink_steps(link_rel, target)?;
+    for step in traversed_lower {
+        if symlink_paths_lower.contains(&step) {
+            return Err(DandiError::UnsafeSymlink {
+                path: link_norm,
+                target: target.to_string(),
+                reason: format!("symlink target traverses another symlink '{step}' in the archive"),
             });
         }
     }

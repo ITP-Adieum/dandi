@@ -25,7 +25,17 @@ pub(crate) fn inspect_7z(archive_path: &Path, opts: &InspectOptions) -> Result<A
     let reader = ArchiveReader::open(&fs_path, pw).map_err(map_7z_error)?;
     let archive = reader.archive();
 
-    let mut entries = Vec::with_capacity(archive.files.len());
+    if archive.files.len() > opts.budget.max_entries {
+        return Err(DandiError::BudgetExceeded {
+            reason: format!(
+                "7z archive declares {} entries, exceeding limit {}",
+                archive.files.len(),
+                opts.budget.max_entries
+            ),
+        });
+    }
+
+    let mut entries = Vec::with_capacity(archive.files.len().min(4096));
     let mut total_uncompressed = 0u64;
     let mut any_encrypted = false;
 
@@ -109,10 +119,20 @@ pub(crate) fn unpack_7z(
     };
 
     let mut budget = opts.budget.clone();
+    budget.set_archive_compressed_size(archive_file_size);
     let mut visible_for_smart: Vec<(String, EntryKind)> = Vec::new();
     let mut junk_skipped = 0usize;
     let mut total_bytes_planned = 0u64;
     let total_count = reader.archive().files.len();
+
+    if total_count > budget.max_entries {
+        return Err(DandiError::BudgetExceeded {
+            reason: format!(
+                "7z archive declares {total_count} entries, exceeding limit {}",
+                budget.max_entries
+            ),
+        });
+    }
 
     for (idx, file) in reader.archive().files.iter().enumerate() {
         opts.cancel.check()?;
@@ -131,7 +151,7 @@ pub(crate) fn unpack_7z(
         } else {
             EntryKind::File
         };
-        budget.record_entry(file.size(), archive_file_size)?;
+        budget.record_entry(file.size(), 0)?;
         let sanitized = sanitize_entry_path(&name_nfc, opts.path_policy)?;
         visible_for_smart.push((sanitized.normalized, kind));
         total_bytes_planned = total_bytes_planned.saturating_add(file.size());
@@ -167,13 +187,21 @@ pub(crate) fn unpack_7z(
         }
 
         let name_nfc: String = entry.name().nfc().collect();
-        if opts.exclude_os_junk && is_os_junk(&name_nfc) {
-            return Ok(true);
-        }
-        if let Some(ref sel) = opts.selected_entries {
-            if !sel.contains(&current_idx) {
-                return Ok(true);
+        let skip_entry = (opts.exclude_os_junk && is_os_junk(&name_nfc))
+            || opts
+                .selected_entries
+                .as_ref()
+                .is_some_and(|sel| !sel.contains(&current_idx));
+        if skip_entry {
+            if !entry.is_directory() && entry.size() > 0 {
+                if let Err(e) =
+                    budget.record_written_bytes(entry.size(), entry.size(), archive_file_size)
+                {
+                    callback_err = Some(e);
+                    return Ok(false);
+                }
             }
+            return Ok(true);
         }
 
         let sanitized = match sanitize_entry_path(&name_nfc, opts.path_policy) {

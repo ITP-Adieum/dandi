@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
@@ -9,39 +10,162 @@ use lzma_rust2::XzReader;
 use tar::{Archive, EntryType};
 
 use crate::archive::{
-    check_not_through_archive_symlink, ensure_no_symlink_ancestors, plan_extract_root,
-    synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary, DirCleanupGuard,
-    EntryKind, InspectOptions, UnpackOptions, UnpackReport,
+    check_not_through_archive_symlink, check_symlink_chain_safe, ensure_no_symlink_ancestors,
+    plan_extract_root, synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary,
+    DirCleanupGuard, EntryKind, InspectOptions, UnpackOptions, UnpackReport,
 };
-use crate::codec::{decode_entry_name, detect_archive_encoding, EntryEncodingFlags};
+use crate::codec::{decode_entry_name_with_override, detect_archive_encoding, EntryEncodingFlags};
 use crate::error::{DandiError, Result};
 use crate::platform::{
     apply_unix_mode, create_relative_symlink, read_zone_identifier, set_mtime, to_fs_path,
     write_zone_identifier,
 };
-use crate::progress::{ProgressEvent, ProgressObserver, ProgressPhase};
-use crate::safety::{is_os_junk, sanitize_entry_path, validate_symlink_target, CollisionTracker};
+use crate::progress::{CancellationToken, ProgressEvent, ProgressObserver, ProgressPhase};
+use crate::safety::{
+    is_os_junk, sanitize_entry_path, validate_symlink_target, CollisionTracker, SafetyBudget,
+};
 
 const STREAM_BUF_SIZE: usize = 256 * 1024;
 
-fn open_tar_reader(archive_path: &Path, fmt: ArchiveFormat) -> Result<Box<dyn Read>> {
+type StreamErrorSlot = Arc<Mutex<Option<DandiError>>>;
+
+/// Wraps a decompressed TAR byte stream to enforce `SafetyBudget` and `CancellationToken`
+/// continuously across ALL entries (including skipped/unselected entries and header scans).
+struct BudgetedReader<R: Read> {
+    inner: R,
+    bytes_read: u64,
+    archive_file_size: u64,
+    max_total_bytes: u64,
+    max_compression_ratio: f64,
+    ratio_check_threshold_bytes: u64,
+    cancel: CancellationToken,
+    error_slot: StreamErrorSlot,
+}
+
+impl<R: Read> BudgetedReader<R> {
+    fn new(
+        inner: R,
+        archive_file_size: u64,
+        budget: &SafetyBudget,
+        cancel: CancellationToken,
+        error_slot: StreamErrorSlot,
+    ) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+            archive_file_size: archive_file_size.max(1),
+            max_total_bytes: budget.max_total_bytes,
+            max_compression_ratio: budget.max_compression_ratio,
+            ratio_check_threshold_bytes: budget.ratio_check_threshold_bytes,
+            cancel,
+            error_slot,
+        }
+    }
+
+    fn record_stream_error(&self, err: DandiError) -> io::Error {
+        let msg = err.to_string();
+        if let Ok(mut guard) = self.error_slot.lock() {
+            if guard.is_none() {
+                *guard = Some(err);
+            }
+        }
+        io::Error::new(io::ErrorKind::Interrupted, msg)
+    }
+}
+
+impl<R: Read> Read for BudgetedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(self.record_stream_error(DandiError::Cancelled));
+        }
+
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+
+        self.bytes_read = match self.bytes_read.checked_add(n as u64) {
+            Some(v) => v,
+            None => {
+                return Err(self.record_stream_error(DandiError::BudgetExceeded {
+                    reason: "TAR decompressed stream byte counter overflow".to_string(),
+                }));
+            }
+        };
+
+        // Allow 512-byte TAR header/padding overhead margin while strictly bounding stream bombs.
+        let stream_limit = self.max_total_bytes.saturating_add(1024 * 1024);
+        if self.bytes_read > stream_limit {
+            return Err(self.record_stream_error(DandiError::BudgetExceeded {
+                reason: format!(
+                    "TAR decompressed stream {} bytes exceeds limit {} bytes",
+                    self.bytes_read, self.max_total_bytes
+                ),
+            }));
+        }
+
+        if self.bytes_read >= self.ratio_check_threshold_bytes {
+            let ratio = (self.bytes_read as f64) / (self.archive_file_size as f64);
+            if ratio > self.max_compression_ratio {
+                return Err(self.record_stream_error(DandiError::BudgetExceeded {
+                    reason: format!(
+                        "TAR stream expansion ratio {ratio:.1}x exceeds limit {:.1}x",
+                        self.max_compression_ratio
+                    ),
+                }));
+            }
+        }
+
+        Ok(n)
+    }
+}
+
+fn take_stream_or_corrupt(slot: &StreamErrorSlot, err: io::Error) -> DandiError {
+    if let Ok(mut guard) = slot.lock() {
+        if let Some(dandi_err) = guard.take() {
+            return dandi_err;
+        }
+    }
+    DandiError::CorruptArchive(err.to_string())
+}
+
+fn open_tar_reader(
+    archive_path: &Path,
+    fmt: ArchiveFormat,
+    budget: &SafetyBudget,
+    cancel: CancellationToken,
+) -> Result<(Box<dyn Read>, StreamErrorSlot, u64)> {
     let fs_path = to_fs_path(archive_path);
+    let archive_file_size = fs::metadata(&fs_path).map(|m| m.len()).unwrap_or(1).max(1);
     let file = File::open(&fs_path).map_err(|e| DandiError::io(archive_path, e))?;
     let buffered = BufReader::with_capacity(STREAM_BUF_SIZE, file);
-    match fmt {
-        ArchiveFormat::Tar => Ok(Box::new(buffered)),
-        ArchiveFormat::TarGz => Ok(Box::new(GzDecoder::new(buffered))),
-        ArchiveFormat::TarBz2 => Ok(Box::new(BzDecoder::new(buffered))),
+    let error_slot: StreamErrorSlot = Arc::new(Mutex::new(None));
+
+    let raw: Box<dyn Read> = match fmt {
+        ArchiveFormat::Tar => Box::new(buffered),
+        ArchiveFormat::TarGz => Box::new(GzDecoder::new(buffered)),
+        ArchiveFormat::TarBz2 => Box::new(BzDecoder::new(buffered)),
         ArchiveFormat::TarZst => {
             let dec = zstd::stream::read::Decoder::new(buffered)
                 .map_err(|e| DandiError::CorruptArchive(e.to_string()))?;
-            Ok(Box::new(dec))
+            Box::new(dec)
         }
-        ArchiveFormat::TarXz => Ok(Box::new(XzReader::new(buffered, true))),
-        _ => Err(DandiError::UnsupportedFormat(
-            fmt.display_name().to_string(),
-        )),
-    }
+        ArchiveFormat::TarXz => Box::new(XzReader::new(buffered, true)),
+        _ => {
+            return Err(DandiError::UnsupportedFormat(
+                fmt.display_name().to_string(),
+            ))
+        }
+    };
+
+    let wrapped = BudgetedReader::new(
+        raw,
+        archive_file_size,
+        budget,
+        cancel,
+        Arc::clone(&error_slot),
+    );
+    Ok((Box::new(wrapped), error_slot, archive_file_size))
 }
 
 struct TarMetaEntry {
@@ -57,23 +181,23 @@ struct TarMetaEntry {
 fn scan_tar_metadata(
     archive_path: &Path,
     fmt: ArchiveFormat,
-    max_entries: usize,
-) -> Result<Vec<TarMetaEntry>> {
-    let reader = open_tar_reader(archive_path, fmt)?;
+    budget: &SafetyBudget,
+    cancel: &CancellationToken,
+) -> Result<(Vec<TarMetaEntry>, u64)> {
+    let (reader, error_slot, archive_file_size) =
+        open_tar_reader(archive_path, fmt, budget, cancel.clone())?;
     let mut tar_archive = Archive::new(reader);
     let mut items = Vec::new();
+    let mut scan_budget = budget.clone();
+    scan_budget.set_archive_compressed_size(archive_file_size);
 
     for (idx, entry_res) in tar_archive
         .entries()
-        .map_err(|e| DandiError::CorruptArchive(e.to_string()))?
+        .map_err(|e| take_stream_or_corrupt(&error_slot, e))?
         .enumerate()
     {
-        if idx >= max_entries {
-            return Err(DandiError::BudgetExceeded {
-                reason: format!("TAR entry count exceeds limit {max_entries}"),
-            });
-        }
-        let entry = entry_res.map_err(|e| DandiError::CorruptArchive(e.to_string()))?;
+        cancel.check()?;
+        let entry = entry_res.map_err(|e| take_stream_or_corrupt(&error_slot, e))?;
         let entry_type = entry.header().entry_type();
         let kind = match entry_type {
             EntryType::Directory => EntryKind::Directory,
@@ -83,6 +207,8 @@ fn scan_tar_metadata(
         };
         let raw_name = entry.path_bytes().into_owned();
         let size = entry.header().size().unwrap_or(0);
+        scan_budget.record_entry(size, 0)?;
+
         let mtime = entry.header().mtime().ok().map(|v| v as i64);
         let unix_mode = entry.header().mode().ok();
         let symlink_target = if kind == EntryKind::Symlink {
@@ -104,7 +230,7 @@ fn scan_tar_metadata(
         });
     }
 
-    Ok(items)
+    Ok((items, archive_file_size))
 }
 
 pub(crate) fn inspect_tar(
@@ -112,20 +238,24 @@ pub(crate) fn inspect_tar(
     fmt: ArchiveFormat,
     opts: &InspectOptions,
 ) -> Result<ArchiveSummary> {
-    let meta_items = scan_tar_metadata(archive_path, fmt, opts.budget.max_entries)?;
+    let cancel = CancellationToken::new();
+    let (meta_items, archive_file_size) =
+        scan_tar_metadata(archive_path, fmt, &opts.budget, &cancel)?;
     let raw_refs: Vec<&[u8]> = meta_items.iter().map(|m| m.raw_name.as_slice()).collect();
     let detection = detect_archive_encoding(&raw_refs, opts.locale_hint);
     let applied_encoding = opts.encoding_override.unwrap_or(detection.encoding);
+    let explicit_override = opts.encoding_override.is_some();
 
     let mut entries = Vec::with_capacity(meta_items.len());
     let mut total_uncompressed = 0u64;
 
     for m in &meta_items {
-        let decoded = decode_entry_name(
+        let decoded = decode_entry_name_with_override(
             &m.raw_name,
             EntryEncodingFlags::default(),
             None,
             applied_encoding,
+            explicit_override,
         );
         let junk = is_os_junk(&decoded.path);
         if junk && !opts.include_os_junk {
@@ -150,9 +280,6 @@ pub(crate) fn inspect_tar(
 
     let entries = synthesize_parent_dirs(entries);
     let total_entries = entries.len();
-    let total_compressed = fs::metadata(to_fs_path(archive_path))
-        .map(|m| m.len())
-        .unwrap_or(0);
 
     Ok(ArchiveSummary {
         format: fmt,
@@ -160,7 +287,7 @@ pub(crate) fn inspect_tar(
         applied_encoding,
         total_entries,
         total_uncompressed_bytes: total_uncompressed,
-        total_compressed_bytes: total_compressed,
+        total_compressed_bytes: archive_file_size,
         encrypted: false,
         entries,
     })
@@ -174,15 +301,13 @@ pub(crate) fn unpack_tar(
     observer: &dyn ProgressObserver,
 ) -> Result<UnpackReport> {
     opts.cancel.check()?;
-    let meta_items = scan_tar_metadata(archive_path, fmt, opts.budget.max_entries)?;
+    let (meta_items, archive_file_size) =
+        scan_tar_metadata(archive_path, fmt, &opts.budget, &opts.cancel)?;
     let raw_refs: Vec<&[u8]> = meta_items.iter().map(|m| m.raw_name.as_slice()).collect();
     let detection = detect_archive_encoding(&raw_refs, opts.locale_hint);
     let applied_encoding = opts.encoding_override.unwrap_or(detection.encoding);
+    let explicit_override = opts.encoding_override.is_some();
 
-    let archive_file_size = fs::metadata(to_fs_path(archive_path))
-        .map(|m| m.len())
-        .unwrap_or(1)
-        .max(1);
     let zone_data = if opts.propagate_zone_identifier {
         read_zone_identifier(archive_path)
     } else {
@@ -190,18 +315,26 @@ pub(crate) fn unpack_tar(
     };
 
     let mut budget = opts.budget.clone();
+    budget.set_archive_compressed_size(archive_file_size);
     let mut visible_for_smart: Vec<(String, EntryKind)> = Vec::new();
     let mut junk_skipped = 0usize;
     let mut total_bytes_planned = 0u64;
-    let mut symlink_paths_lower: HashSet<String> = HashSet::new();
+
+    struct PlannedTarEntry {
+        sanitized_norm: String,
+        kind: EntryKind,
+        symlink_target: Option<String>,
+    }
+    let mut planned_entries: Vec<PlannedTarEntry> = Vec::with_capacity(meta_items.len());
 
     for m in &meta_items {
         opts.cancel.check()?;
-        let decoded = decode_entry_name(
+        let decoded = decode_entry_name_with_override(
             &m.raw_name,
             EntryEncodingFlags::default(),
             None,
             applied_encoding,
+            explicit_override,
         );
         if opts.exclude_os_junk && is_os_junk(&decoded.path) {
             junk_skipped += 1;
@@ -212,14 +345,14 @@ pub(crate) fn unpack_tar(
                 continue;
             }
         }
-        budget.record_entry(m.size, archive_file_size)?;
+        budget.record_entry(m.size, 0)?;
         let sanitized = sanitize_entry_path(&decoded.path, opts.path_policy)?;
-        if m.kind == EntryKind::Symlink {
-            let target = m.symlink_target.as_deref().unwrap_or_default();
-            validate_symlink_target(dest_dir, &sanitized.relative, target)?;
-            symlink_paths_lower.insert(sanitized.normalized.to_lowercase());
-        }
-        visible_for_smart.push((sanitized.normalized, m.kind));
+        visible_for_smart.push((sanitized.normalized.clone(), m.kind));
+        planned_entries.push(PlannedTarEntry {
+            sanitized_norm: sanitized.normalized,
+            kind: m.kind,
+            symlink_target: m.symlink_target.clone(),
+        });
         total_bytes_planned = total_bytes_planned.saturating_add(m.size);
     }
 
@@ -231,11 +364,34 @@ pub(crate) fn unpack_tar(
         &visible_for_smart,
     )?;
 
+    // Populate symlink_paths_lower AFTER plan_extract_root using stripped effective paths
+    // (matching zip_io.rs) and validate all symlinks against escape and multi-hop chaining.
+    let mut symlink_paths_lower: HashSet<String> = HashSet::new();
+    let mut prevalidated_symlinks: Vec<(PathBuf, String)> = Vec::new();
+    for pe in &planned_entries {
+        if pe.kind != EntryKind::Symlink {
+            continue;
+        }
+        let eff_str = strip_prefix(&pe.sanitized_norm, plan.strip_prefix.as_deref());
+        if eff_str.is_empty() {
+            continue;
+        }
+        let eff = sanitize_entry_path(&eff_str, opts.path_policy)?;
+        let target = pe.symlink_target.as_deref().unwrap_or_default();
+        validate_symlink_target(&plan.extract_root, &eff.relative, target)?;
+        symlink_paths_lower.insert(eff.normalized.to_lowercase());
+        prevalidated_symlinks.push((eff.relative, target.to_string()));
+    }
+    for (link_rel, target) in &prevalidated_symlinks {
+        check_symlink_chain_safe(link_rel, target, &symlink_paths_lower)?;
+    }
+
     fs::create_dir_all(to_fs_path(&plan.extract_root))
         .map_err(|e| DandiError::io(&plan.extract_root, e))?;
     let mut dir_guard = DirCleanupGuard::new(plan.cleanup_root.clone());
 
-    let reader = open_tar_reader(archive_path, fmt)?;
+    let (reader, error_slot, _) =
+        open_tar_reader(archive_path, fmt, &opts.budget, opts.cancel.clone())?;
     let mut tar_archive = Archive::new(reader);
 
     let mut collisions = CollisionTracker::new();
@@ -255,11 +411,11 @@ pub(crate) fn unpack_tar(
 
     for (idx, entry_res) in tar_archive
         .entries()
-        .map_err(|e| DandiError::CorruptArchive(e.to_string()))?
+        .map_err(|e| take_stream_or_corrupt(&error_slot, e))?
         .enumerate()
     {
         opts.cancel.check()?;
-        let mut entry = entry_res.map_err(|e| DandiError::CorruptArchive(e.to_string()))?;
+        let mut entry = entry_res.map_err(|e| take_stream_or_corrupt(&error_slot, e))?;
         let entry_type = entry.header().entry_type();
         let kind = match entry_type {
             EntryType::Directory => EntryKind::Directory,
@@ -275,11 +431,12 @@ pub(crate) fn unpack_tar(
         }
 
         let raw_name = entry.path_bytes().into_owned();
-        let decoded = decode_entry_name(
+        let decoded = decode_entry_name_with_override(
             &raw_name,
             EntryEncodingFlags::default(),
             None,
             applied_encoding,
+            explicit_override,
         );
         if opts.exclude_os_junk && is_os_junk(&decoded.path) {
             continue;
@@ -289,15 +446,7 @@ pub(crate) fn unpack_tar(
         if sanitized.was_sanitized {
             sanitized_paths += 1;
         }
-        let eff_str = match plan.strip_prefix.as_deref() {
-            Some(p) if sanitized.normalized == p => String::new(),
-            Some(p) => sanitized
-                .normalized
-                .strip_prefix(&format!("{p}/"))
-                .unwrap_or(&sanitized.normalized)
-                .to_string(),
-            None => sanitized.normalized.clone(),
-        };
+        let eff_str = strip_prefix(&sanitized.normalized, plan.strip_prefix.as_deref());
         if eff_str.is_empty() {
             continue;
         }
@@ -327,6 +476,7 @@ pub(crate) fn unpack_tar(
                     .unwrap_or_default();
                 let resolved_rel = collisions.resolve_file(&eff);
                 validate_symlink_target(&plan.extract_root, &resolved_rel, &target)?;
+                check_symlink_chain_safe(&resolved_rel, &target, &symlink_paths_lower)?;
                 pending_symlinks.push(PendingSymlink {
                     link_rel: resolved_rel,
                     target,
@@ -356,7 +506,7 @@ pub(crate) fn unpack_tar(
                     opts.cancel.check()?;
                     let n = entry
                         .read(&mut read_buf)
-                        .map_err(|e| DandiError::CorruptArchive(e.to_string()))?;
+                        .map_err(|e| take_stream_or_corrupt(&error_slot, e))?;
                     if n == 0 {
                         break;
                     }
@@ -392,6 +542,8 @@ pub(crate) fn unpack_tar(
 
     for sym in pending_symlinks {
         opts.cancel.check()?;
+        check_symlink_chain_safe(&sym.link_rel, &sym.target, &symlink_paths_lower)?;
+        ensure_no_symlink_ancestors(&plan.extract_root, &sym.link_rel)?;
         let abs_link = plan.extract_root.join(&sym.link_rel);
         if let Some(parent) = abs_link.parent() {
             fs::create_dir_all(to_fs_path(parent)).map_err(|e| DandiError::io(parent, e))?;
@@ -429,4 +581,15 @@ pub(crate) fn unpack_tar(
         sanitized_paths,
         renamed_collisions: collisions.into_renames(),
     })
+}
+
+fn strip_prefix(normalized: &str, prefix: Option<&str>) -> String {
+    match prefix {
+        Some(p) if normalized == p => String::new(),
+        Some(p) => normalized
+            .strip_prefix(&format!("{p}/"))
+            .unwrap_or(normalized)
+            .to_string(),
+        None => normalized.to_string(),
+    }
 }
