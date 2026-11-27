@@ -613,3 +613,254 @@ fn unrelated_numbered_siblings_survive_and_standalone_numbered_zip_opens() {
 
     assert_eq!(listed_paths(&yearly), vec!["readme.txt"]);
 }
+
+fn try_pack_split(
+    input: &Path,
+    out: &Path,
+    style: SplitStyle,
+    compression_level: u32,
+) -> Result<PackReport, DandiError> {
+    pack(
+        &[input.to_path_buf()],
+        out,
+        &PackOptions {
+            split_size_bytes: Some(SPLIT),
+            split_style: style,
+            compression_level,
+            ..PackOptions::default()
+        },
+        &NoopProgressObserver,
+    )
+}
+
+/// Writes `bytes` as `count` consecutive parts named by `name_of(1..=count)`.
+fn write_parts(bytes: &[u8], count: usize, name_of: impl Fn(usize) -> PathBuf) -> Vec<PathBuf> {
+    (0..count)
+        .map(|i| {
+            let p = name_of(i + 1);
+            fs::write(
+                &p,
+                &bytes[i * bytes.len() / count..(i + 1) * bytes.len() / count],
+            )
+            .unwrap();
+            p
+        })
+        .collect()
+}
+
+fn assert_split_conflict(result: Result<PackReport, DandiError>, stray: &str) {
+    match result {
+        Err(DandiError::InvalidInput(msg)) => assert!(msg.contains(stray), "{msg}"),
+        other => panic!("expected a conflict naming {stray}, got {other:?}"),
+    }
+}
+
+/// Issue #6 (1): with no `.001` / `.z01` there is no older set, so a contiguous run of
+/// look-alike numbers right after the new set is user data, not stale volumes.
+#[test]
+fn overwrite_without_an_old_set_never_removes_lookalike_volumes() {
+    let tmp = TempDir::new().unwrap();
+    let bundle = make_tree(&tmp.path().join("src"), 150);
+    let probe = tmp.path().join("probe");
+
+    let count = pack_split(
+        &bundle,
+        &probe.join("n.zip"),
+        SplitStyle::Numeric,
+        SPLIT,
+        None,
+    )
+    .output_volumes
+    .len();
+    let out_dir = tmp.path().join("num");
+    fs::create_dir_all(&out_dir).unwrap();
+    let lookalikes: Vec<PathBuf> = (count + 1..=count + 2)
+        .map(|i| out_dir.join(format!("n.zip.{i:03}")))
+        .collect();
+    for p in &lookalikes {
+        fs::write(p, b"user data").unwrap();
+    }
+    // Keeping them would make the new set unreadable (gap before them), so the pack refuses.
+    let first = lookalikes[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_split_conflict(
+        try_pack_split(&bundle, &out_dir.join("n.zip"), SplitStyle::Numeric, 6),
+        &first,
+    );
+    for p in &lookalikes {
+        assert_eq!(fs::read(p).unwrap(), b"user data", "{p:?}");
+    }
+    assert_eq!(
+        dir_names(&out_dir).len(),
+        lookalikes.len(),
+        "{:?}",
+        dir_names(&out_dir)
+    );
+
+    let disks = pack_split(
+        &bundle,
+        &probe.join("p.zip"),
+        SplitStyle::PkwareZip,
+        SPLIT,
+        None,
+    )
+    .output_volumes
+    .len();
+    let pk_dir = tmp.path().join("pk");
+    fs::create_dir_all(&pk_dir).unwrap();
+    let pk_lookalikes: Vec<PathBuf> = (disks..disks + 2)
+        .map(|i| pk_dir.join(format!("p.z{i:02}")))
+        .collect();
+    for p in &pk_lookalikes {
+        fs::write(p, b"user data").unwrap();
+    }
+    let report = pack_split(
+        &bundle,
+        &pk_dir.join("p.zip"),
+        SplitStyle::PkwareZip,
+        SPLIT,
+        None,
+    );
+    assert_eq!(report.output_volumes.len(), disks);
+    for p in &pk_lookalikes {
+        assert_eq!(fs::read(p).unwrap(), b"user data", "{p:?}");
+    }
+    let dest = tmp.path().join("x");
+    unpack_direct(&pk_dir.join("p.zip"), &dest, None);
+    assert_eq!(hash_tree(&dest.join("bundle")), hash_tree(&bundle));
+}
+
+/// Issue #6 (2): an unrelated `<name>.099` would make the reader demand `.004`…`.098`, so the
+/// writer refuses before commit instead of producing a set that `list` cannot open.
+#[test]
+fn stray_numbered_sibling_is_a_conflict_not_a_broken_set() {
+    let tmp = TempDir::new().unwrap();
+    let bundle = make_tree(&tmp.path().join("src"), 150);
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let stray = out_dir.join("s.zip.099");
+    fs::write(&stray, b"not a volume").unwrap();
+
+    assert_split_conflict(
+        try_pack_split(&bundle, &out_dir.join("s.zip"), SplitStyle::Numeric, 6),
+        "s.zip.099",
+    );
+    assert_eq!(fs::read(&stray).unwrap(), b"not a volume");
+    assert_eq!(dir_names(&out_dir), vec!["s.zip.099"]);
+
+    // An older set whose tail is replaced is fine; the stray beyond it still conflicts.
+    let moved = tmp.path().join("s.zip.099");
+    fs::rename(&stray, &moved).unwrap();
+    let report = pack_split(
+        &bundle,
+        &out_dir.join("s.zip"),
+        SplitStyle::Numeric,
+        SPLIT,
+        None,
+    );
+    assert!(report.output_volumes.len() < 99);
+    assert!(!listed_paths(&report.output_volumes[0]).is_empty());
+    fs::rename(&moved, &stray).unwrap();
+    let small = make_tree(&tmp.path().join("small"), 70);
+    assert_split_conflict(
+        try_pack_split(&small, &out_dir.join("s.zip"), SplitStyle::Numeric, 6),
+        "s.zip.099",
+    );
+    // The refused pack left the earlier set intact and readable.
+    for vol in &report.output_volumes {
+        assert!(vol.exists(), "{vol:?}");
+    }
+    let dest = tmp.path().join("x");
+    unpack_direct(&report.output_volumes[0], &dest, None);
+    assert_eq!(hash_tree(&dest.join("bundle")), hash_tree(&bundle));
+}
+
+/// Issue #6 (3): 7-Zip style sets grow naturally from `.999` to `.1000`; they open from either end.
+#[test]
+fn numeric_set_rolling_over_from_999_to_1000_opens_from_any_part() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("payload.bin"), pseudo_random(30_000, 42)).unwrap();
+    let single = tmp.path().join("single.zip");
+    pack(
+        std::slice::from_ref(&src),
+        &single,
+        &PackOptions::default(),
+        &NoopProgressObserver,
+    )
+    .unwrap();
+    let bytes = fs::read(&single).unwrap();
+    let expected = listed_paths(&single);
+
+    let roll_dir = tmp.path().join("roll");
+    fs::create_dir_all(&roll_dir).unwrap();
+    let parts = write_parts(&bytes, 1001, |i| roll_dir.join(format!("r.zip.{i:03}")));
+    assert!(parts[999].ends_with("r.zip.1000"));
+    // A look-alike that does not continue the run is not part of the set.
+    fs::write(roll_dir.join("r.zip.2024"), b"unrelated").unwrap();
+    for opener in [&parts[0], &parts[500], &parts[999], &parts[1000]] {
+        assert_eq!(listed_paths(opener), expected, "via {opener:?}");
+    }
+    let dest = tmp.path().join("x");
+    unpack_direct(&parts[999], &dest, None);
+    assert_eq!(hash_tree(&dest.join("src")), hash_tree(&src));
+
+    // Fixed four-digit sets (`.0001`…`.1000`, as dandi writes 1000+ volumes) still open too.
+    let wide_dir = tmp.path().join("wide");
+    fs::create_dir_all(&wide_dir).unwrap();
+    let wide = write_parts(&bytes, 1000, |i| wide_dir.join(format!("w.zip.{i:04}")));
+    for opener in [&wide[0], &wide[999]] {
+        assert_eq!(listed_paths(opener), expected, "via {opener:?}");
+    }
+}
+
+/// Issue #6 (1): packing exactly 999 volumes must not delete a `.1000` that is not a verified
+/// member of an older naturally grown set — but does remove it when it is.
+#[test]
+fn packing_999_volumes_only_removes_1000_of_a_verified_old_set() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let blob = src.join("blob.bin");
+
+    // Stored entries make the archive size predictable: measure the fixed overhead once.
+    fs::write(&blob, vec![0u8; 100_000]).unwrap();
+    let probe = try_pack_split(
+        &src,
+        &tmp.path().join("probe/p.zip"),
+        SplitStyle::Numeric,
+        0,
+    )
+    .unwrap();
+    let overhead = probe.output_bytes - 100_000;
+    let payload = 999 * SPLIT - overhead - 1000;
+    fs::File::create(&blob).unwrap().set_len(payload).unwrap();
+
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let out = out_dir.join("big.zip");
+    let user_1000 = out_dir.join("big.zip.1000");
+    fs::write(&user_1000, b"user data").unwrap();
+    assert_split_conflict(
+        try_pack_split(&src, &out, SplitStyle::Numeric, 0),
+        "big.zip.1000",
+    );
+    assert_eq!(fs::read(&user_1000).unwrap(), b"user data");
+    assert_eq!(dir_names(&out_dir), vec!["big.zip.1000"]);
+
+    // A verified older set `.001`…`.999`, `.1000`: its `.1000` is stale and goes.
+    write_parts(&[0u8; 2002], 1000, |i| {
+        out_dir.join(format!("big.zip.{i:03}"))
+    });
+    let report = try_pack_split(&src, &out, SplitStyle::Numeric, 0).unwrap();
+    assert_eq!(report.output_volumes.len(), 999);
+    assert!(!user_1000.exists(), "stale .1000 of the old set survived");
+    assert_eq!(
+        listed_paths(&report.output_volumes[0]),
+        listed_paths(&probe.output_volumes[0])
+    );
+}
