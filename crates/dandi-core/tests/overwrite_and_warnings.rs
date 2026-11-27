@@ -217,6 +217,48 @@ fn direct_mode_enforces_overwrite_false_for_symlinks_in_zip_and_tar() {
             .unwrap()
             .file_type()
             .is_symlink());
+
+        // Second unpack onto an EXISTING symlink:
+        // Remove target.txt so Phase 1 succeeds and Phase 2 specifically tests existing-symlink leaf behavior.
+        fs::remove_file(dest.join("bundle/target.txt")).unwrap();
+        let res_existing_sym = unpack(
+            archive,
+            &dest,
+            &UnpackOptions {
+                mode: ExtractMode::Direct,
+                overwrite: false,
+                ..UnpackOptions::default()
+            },
+            &NoopProgressObserver,
+        );
+        assert!(
+            matches!(res_existing_sym, Err(DandiError::AlreadyExists { .. })),
+            "expected AlreadyExists (not UnsafeSymlink) onto existing symlink in {}, got {res_existing_sym:?}",
+            archive.display()
+        );
+        assert!(fs::symlink_metadata(dest.join("bundle/link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // With overwrite: true, re-unpacking onto an existing symlink succeeds cleanly.
+        let report2 = unpack(
+            archive,
+            &dest,
+            &UnpackOptions {
+                mode: ExtractMode::Direct,
+                overwrite: true,
+                ..UnpackOptions::default()
+            },
+            &NoopProgressObserver,
+        )
+        .unwrap();
+        assert_eq!(report2.symlinks_created, 1);
+        assert_eq!(report2.symlinks_skipped, 0);
+        assert!(fs::symlink_metadata(dest.join("bundle/link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }
 

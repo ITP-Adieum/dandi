@@ -1326,6 +1326,7 @@ pub(crate) fn repack_zip_nfc(
     }
 
     let (output_bytes, _) = writer.finish()?;
+    drop(archive);
     commit_temp_file(&tmp_path, dst_zip, opts.overwrite)?;
     guard.disarm();
 
@@ -1336,4 +1337,63 @@ pub(crate) fn repack_zip_nfc(
         junk_skipped,
         output_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::zip::header::inspect_zip_raw_headers;
+    use crate::archive::{unpack, ExtractMode, UnpackOptions};
+    use crate::progress::NoopProgressObserver;
+    use tempfile::TempDir;
+
+    #[test]
+    fn repack_nfc_in_place_succeeds_when_src_equals_dst() {
+        let tmp = TempDir::new().unwrap();
+        let src_dir = tmp.path().join("in_place_src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let file_name = "가나다_테스트.txt";
+        let payload = b"in-place repack payload";
+        fs::write(src_dir.join(file_name), payload).unwrap();
+
+        let zip_path = tmp.path().join("same.zip");
+        pack_zip(
+            &[src_dir],
+            &zip_path,
+            &PackOptions::default(),
+            &NoopProgressObserver,
+        )
+        .unwrap();
+
+        // Repack directly in-place (src_zip == dst_zip); must not fail with Windows sharing violation.
+        let report = repack_zip_nfc(
+            &zip_path,
+            &zip_path,
+            &RepackOptions::default(),
+            &NoopProgressObserver,
+        )
+        .unwrap();
+        assert_eq!(report.output_path, zip_path);
+        assert!(report.entries_repacked >= 1);
+
+        let headers = inspect_zip_raw_headers(&zip_path).unwrap();
+        assert!(!headers.is_empty());
+        assert!(headers.iter().all(|h| h.utf8_bit11()));
+
+        let out_dir = tmp.path().join("out");
+        unpack(
+            &zip_path,
+            &out_dir,
+            &UnpackOptions {
+                mode: ExtractMode::Direct,
+                ..UnpackOptions::default()
+            },
+            &NoopProgressObserver,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(out_dir.join("in_place_src").join(file_name)).unwrap(),
+            payload
+        );
+    }
 }

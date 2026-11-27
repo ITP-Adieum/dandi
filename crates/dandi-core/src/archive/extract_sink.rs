@@ -216,6 +216,8 @@ impl ExtractionSink {
         let resolved = self.collisions.resolve_file(&eff);
         validate_symlink_target(&self.extract_root, resolved.relative(), &target)?;
         check_symlink_chain_safe(resolved.relative(), &target, &self.symlink_paths_lower)?;
+        self.symlink_paths_lower
+            .insert(resolved.normalized().to_lowercase());
 
         self.pending_symlinks.push(PendingSymlink {
             link_rel: resolved.relative().to_path_buf(),
@@ -361,7 +363,11 @@ impl ExtractionSink {
         for sym in std::mem::take(&mut self.pending_symlinks) {
             self.cancel.check()?;
             check_symlink_chain_safe(&sym.link_rel, &sym.target, &self.symlink_paths_lower)?;
-            ensure_no_symlink_ancestors(&self.extract_root, &sym.link_rel)?;
+            if let Some(parent_rel) = sym.link_rel.parent() {
+                if !parent_rel.as_os_str().is_empty() {
+                    ensure_no_symlink_ancestors(&self.extract_root, parent_rel)?;
+                }
+            }
 
             let abs_link = self.extract_root.join(&sym.link_rel);
             let fs_link = to_fs_path(&abs_link);
@@ -415,11 +421,15 @@ impl ExtractionSink {
             }
         }
 
-        // Apply directory permissions and mtimes bottom-up so child writes don't clobber parent mtimes.
-        for meta in std::mem::take(&mut self.deferred_dir_meta)
-            .into_iter()
-            .rev()
-        {
+        // Apply directory permissions and mtimes bottom-up (deepest first) so child writes don't clobber parent mtimes.
+        let mut deferred_dirs = std::mem::take(&mut self.deferred_dir_meta);
+        deferred_dirs.sort_by(|a, b| {
+            b.dir_path
+                .components()
+                .count()
+                .cmp(&a.dir_path.components().count())
+        });
+        for meta in deferred_dirs {
             if let Err(e) = set_mtime(&meta.dir_path, meta.mtime, false) {
                 self.warnings.push(UnpackWarning::MtimeApplyFailed {
                     path: meta.dir_norm.clone(),

@@ -58,7 +58,7 @@ impl SanitizedPath {
 
     /// Internal constructor used by `CollisionTracker` for deterministic suffix renames
     /// derived from an already-validated `SanitizedPath`.
-    pub(crate) fn from_collision_rename(normalized: String, was_sanitized: bool) -> Self {
+    fn from_collision_rename(normalized: String, was_sanitized: bool) -> Self {
         let mut relative = PathBuf::new();
         for seg in normalized.split('/') {
             relative.push(seg);
