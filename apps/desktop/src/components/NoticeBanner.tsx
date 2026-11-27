@@ -69,9 +69,14 @@ export function NoticeBanner({ t, notice, onRevealPath, onClose }: NoticeBannerP
         <div className="flex min-w-0 items-start gap-2">
           <Icon className="mt-0.5 h-4 w-4 shrink-0" />
           <div className="min-w-0 space-y-0.5">
-            <div className="truncate font-medium">{notice.title}</div>
+            <div className="truncate font-medium" title={notice.title}>
+              {notice.title}
+            </div>
             {notice.detail && (
-              <div className="font-mono-tabular truncate text-[11px] opacity-85">
+              <div
+                className="font-mono-tabular truncate text-[11px] opacity-85"
+                title={notice.detail}
+              >
                 {notice.detail}
               </div>
             )}
@@ -133,7 +138,7 @@ export function NoticeBanner({ t, notice, onRevealPath, onClose }: NoticeBannerP
               className="flex flex-col gap-0.5 border-b border-current/10 pb-1.5 last:border-b-0 last:pb-0"
             >
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="rounded border border-current/30 px-1.5 py-0.2 text-[10px] font-semibold">
+                <span className="rounded border border-current/30 px-1.5 py-0.5 text-[10px] font-semibold">
                   {item.label}
                 </span>
                 <span className="font-mono-tabular break-all font-medium">

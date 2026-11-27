@@ -5,6 +5,7 @@
 # volumes (prevents MacPacker#275 / #305).
 
 set -euo pipefail
+shopt -u patsub_replacement 2>/dev/null || true
 
 DRY_RUN=0
 DANDI_BIN_ARG=""
@@ -95,7 +96,9 @@ xml_escape() {
 
 bash_single_quote() {
   local s="$1"
-  printf "'%s'" "${s//\'/\'\\\'\'}"
+  local sq="'"
+  local rep="'\\''"
+  printf "'%s'" "${s//$sq/$rep}"
 }
 
 DANDI_BIN="$(resolve_dandi_bin)"
@@ -115,7 +118,7 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:\${HOME}/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 notify() {
-  /usr/bin/osascript - "\$1" "\$2" <<'APPLESCRIPT'
+  /usr/bin/osascript - "\$1" "\$2" <<'APPLESCRIPT' || true
 on run argv
   display notification (item 2 of argv) with title (item 1 of argv)
 end run
@@ -158,10 +161,10 @@ if [[ \$# -eq 0 ]]; then
 fi
 
 first_item="\$1"
-parent_dir="\$(dirname "\$first_item")"
+parent_dir="\$(dirname -- "\$first_item")"
 
 if [[ \$# -eq 1 ]]; then
-  item_name="\$(basename "\$first_item")"
+  item_name="\$(basename -- "\$first_item")"
   if [[ -d "\$first_item" ]]; then
     stem="\$item_name"
   else
@@ -181,10 +184,10 @@ while [[ -e "\$out_zip" ]]; do
   idx=\$((idx + 1))
 done
 
-if err_out=\$("\$DANDI_BIN" pack -o "\$out_zip" "\$@" 2>&1); then
-  notify "Dandi" "Created \$(basename "\$out_zip")"
+if err_out=\$("\$DANDI_BIN" pack -o "\$out_zip" -- "\$@" 2>&1); then
+  notify "Dandi" "Created \$(basename -- "\$out_zip")"
 else
-  first_line="\$(printf '%s' "\$err_out" | head -n 1)"
+  first_line="\${err_out%%\$'\n'*}"
   notify "Dandi" "Compression failed: \${first_line:-unknown error}"
   exit 1
 fi
@@ -204,13 +207,13 @@ last_ok_name=""
 last_err=""
 
 for archive in "\$@"; do
-  dest_dir="\$(dirname "\$archive")"
-  if out=\$("\$DANDI_BIN" unpack "\$archive" --dest "\$dest_dir" --mode smart 2>&1); then
+  dest_dir="\$(dirname -- "\$archive")"
+  if out=\$("\$DANDI_BIN" unpack --dest "\$dest_dir" --mode smart -- "\$archive" 2>&1); then
     ok_count=\$((ok_count + 1))
-    last_ok_name="\$(basename "\$archive")"
+    last_ok_name="\$(basename -- "\$archive")"
   else
     fail_count=\$((fail_count + 1))
-    last_err="\$(printf '%s' "\$out" | head -n 1)"
+    last_err="\${out%%\$'\n'*}"
   fi
 done
 

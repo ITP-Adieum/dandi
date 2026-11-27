@@ -39,8 +39,15 @@ jobs:
             echo "error: invalid release tag '$TAG' (expected vX.Y.Z)" >&2
             exit 1
           fi
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          TAURI_VERSION="$(python3 -c 'import json; print(json.load(open("apps/desktop/src-tauri/tauri.conf.json"))["version"])')"
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" || "$TAG_VERSION" != "$TAURI_VERSION" ]]; then
+            echo "error: release tag '$TAG' (${TAG_VERSION}) does not match Cargo.toml (${CARGO_VERSION}) and tauri.conf.json (${TAURI_VERSION})" >&2
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved release tag: $TAG"
+          echo "Resolved release tag: $TAG (matches Cargo.toml & tauri.conf.json version ${TAG_VERSION})"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -188,6 +195,7 @@ jobs:
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Force -Path dist-assets | Out-Null
 
           pnpm --dir apps/desktop install --frozen-lockfile
