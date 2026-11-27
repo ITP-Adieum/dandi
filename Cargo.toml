@@ -23,12 +23,14 @@ crc32fast = "1.4"
 encoding_rs = "0.8"
 filetime = "0.2"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+getrandom = "0.4"
 lzma-rust2 = { version = "0.26", features = ["std", "xz", "encoder"] }
 proptest = "1.6"
+rars = { version = "0.13", default-features = false, features = ["encryption"] }
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sevenz-rust2 = "0.27"
+sevenz-rust2 = { version = "0.27", features = ["compress", "aes256"] }
 sha2 = "0.10"
 tar = "0.4"
 tempfile = "3.15"

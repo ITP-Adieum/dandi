@@ -85,3 +85,109 @@ fn cli_pack_inspect_list_unpack_fix_roundtrip() {
     assert!(fix_out.status.success());
     assert!(fixed_zip.exists());
 }
+
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+fn run_json(args: &[&std::ffi::OsStr]) -> serde_json::Value {
+    let out = Command::new(env!("CARGO_BIN_EXE_dandi"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn cli_split_and_7z_pack_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("media");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("clip.jpg"), noise(200_000, 1)).unwrap();
+    fs::write(src.join("메모.txt"), "단디".repeat(100)).unwrap();
+
+    let os = |s: &str| std::ffi::OsString::from(s);
+    let zip_path = tmp.path().join("media.zip");
+    let report = run_json(&[
+        &os("pack"),
+        &os("--json"),
+        &os("--split"),
+        &os("64K"),
+        &os("-o"),
+        zip_path.as_os_str(),
+        src.as_os_str(),
+    ]);
+    let volumes = report["output_volumes"].as_array().unwrap();
+    assert!(volumes.len() >= 3, "{report}");
+    assert!(volumes[0].as_str().unwrap().ends_with("media.z01"));
+    assert!(volumes
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .ends_with("media.zip"));
+
+    let z01 = tmp.path().join("media.z01");
+    let listing = run_json(&[&os("list"), &os("--json"), z01.as_os_str()]);
+    assert!(listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["path"] == "media/메모.txt"));
+
+    let sz_path = tmp.path().join("media.7z");
+    let report = run_json(&[
+        &os("pack"),
+        &os("--json"),
+        &os("--format"),
+        &os("7z"),
+        &os("--split"),
+        &os("64K"),
+        &os("--password"),
+        &os("단디-7z!2026"),
+        &os("-o"),
+        sz_path.as_os_str(),
+        src.as_os_str(),
+    ]);
+    assert_eq!(report["encrypted"], true);
+    let first = report["output_path"].as_str().unwrap().to_string();
+    assert!(first.ends_with("media.7z.001"), "{report}");
+
+    let dest = tmp.path().join("out");
+    let unpack = run_json(&[
+        &os("unpack"),
+        &os("--json"),
+        &os("--password"),
+        &os("단디-7z!2026"),
+        &os("-d"),
+        dest.as_os_str(),
+        &os(&first),
+    ]);
+    assert_eq!(unpack["format"], "seven_z");
+    assert_eq!(
+        fs::read(dest.join("media/clip.jpg")).unwrap(),
+        noise(200_000, 1)
+    );
+
+    let bad = Command::new(env!("CARGO_BIN_EXE_dandi"))
+        .args(["pack", "--split", "10X", "-o"])
+        .arg(tmp.path().join("bad.zip"))
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("invalid size"));
+}

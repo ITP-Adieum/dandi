@@ -4,8 +4,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dandi_core::{
-    inspect, pack, repack_nfc, unpack, DandiError, EncodingId, EntryKind, ExtractMode,
-    InspectOptions, NoopProgressObserver, PackOptions, RepackOptions, UnpackOptions, UnpackWarning,
+    inspect, pack, parse_size_spec, repack_nfc, unpack, DandiError, EncodingId, EntryKind,
+    ExtractMode, InspectOptions, NoopProgressObserver, PackFormat, PackOptions, RepackOptions,
+    SplitStyle, UnpackOptions, UnpackWarning,
 };
 
 #[derive(Parser)]
@@ -40,32 +41,75 @@ impl From<CliExtractMode> for ExtractMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliPackFormat {
+    Zip,
+    #[value(name = "7z")]
+    SevenZ,
+}
+
+impl From<CliPackFormat> for PackFormat {
+    fn from(f: CliPackFormat) -> Self {
+        match f {
+            CliPackFormat::Zip => PackFormat::Zip,
+            CliPackFormat::SevenZ => PackFormat::SevenZ,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliSplitStyle {
+    Pkware,
+    Numeric,
+}
+
+impl From<CliSplitStyle> for SplitStyle {
+    fn from(s: CliSplitStyle) -> Self {
+        match s {
+            CliSplitStyle::Pkware => SplitStyle::PkwareZip,
+            CliSplitStyle::Numeric => SplitStyle::Numeric,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Pack files or directories into a cross-OS NFC UTF-8 Golden ZIP
+    /// Pack files or directories into a cross-OS NFC UTF-8 ZIP or .7z archive
     Pack {
         /// Files or directories to pack
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
 
-        /// Output .zip path
+        /// Output archive path (.zip or .7z)
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Deflate compression level (0-9)
+        /// Archive format
+        #[arg(short, long, value_enum, default_value_t = CliPackFormat::Zip)]
+        format: CliPackFormat,
+
+        /// Compression level (0-9)
         #[arg(short, long, default_value_t = 6)]
         level: u32,
 
-        /// Optional password for WinZip AES-256 encryption
+        /// Optional password (WinZip AES-256 for .zip, 7z AES-256 with encrypted names for .7z)
         #[arg(short, long)]
         password: Option<String>,
+
+        /// Split into volumes of at most SIZE (e.g. 512K, 10M, 25M, 1G; minimum 64K)
+        #[arg(long, value_name = "SIZE")]
+        split: Option<String>,
+
+        /// Volume naming: pkware (.z01, .z02, ..., .zip) or numeric (.001, .002, ...). 7z is always numeric
+        #[arg(long, value_enum, default_value_t = CliSplitStyle::Pkware)]
+        split_style: CliSplitStyle,
 
         /// Keep OS metadata junk (.DS_Store, ._*, Thumbs.db, etc.)
         #[arg(long)]
         keep_junk: bool,
     },
 
-    /// Unpack a ZIP, 7z, or TAR archive safely
+    /// Unpack a ZIP, 7z, RAR, or TAR archive (including split volume sets) safely
     Unpack {
         /// Archive path
         archive: PathBuf,
@@ -180,14 +224,21 @@ fn run(cli: Cli) -> Result<(), DandiError> {
         Commands::Pack {
             inputs,
             output,
+            format,
             level,
             password,
+            split,
+            split_style,
             keep_junk,
         } => {
+            let split_size_bytes = split.as_deref().map(parse_size_spec).transpose()?;
             let opts = PackOptions {
+                format: format.into(),
                 compression_level: level,
                 exclude_os_junk: !keep_junk,
                 password,
+                split_size_bytes,
+                split_style: split_style.into(),
                 overwrite: true,
                 ..PackOptions::default()
             };
@@ -196,7 +247,7 @@ fn run(cli: Cli) -> Result<(), DandiError> {
                 print_json(&report)?;
             } else {
                 println!(
-                    "Packed {} entries ({} deflated, {} stored, {} junk skipped) -> {} ({} bytes)",
+                    "Packed {} entries ({} compressed, {} stored, {} junk skipped) -> {} ({} bytes)",
                     report.entries_written,
                     report.files_deflated,
                     report.files_stored,
@@ -204,6 +255,12 @@ fn run(cli: Cli) -> Result<(), DandiError> {
                     report.output_path.display(),
                     report.output_bytes
                 );
+                if report.output_volumes.len() > 1 {
+                    println!("Volumes ({}):", report.output_volumes.len());
+                    for vol in &report.output_volumes {
+                        println!("  {}", vol.display());
+                    }
+                }
             }
         }
         Commands::Unpack {

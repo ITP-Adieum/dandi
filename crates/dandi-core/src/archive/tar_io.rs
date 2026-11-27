@@ -1,4 +1,3 @@
-use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -9,13 +8,14 @@ use lzma_rust2::XzReader;
 use tar::{Archive, EntryType};
 
 use crate::archive::extract_sink::ExtractionSink;
+use crate::archive::split::{discover_volumes, SplitFileReader};
 use crate::archive::{
     plan_extract_root, synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary,
     EntryKind, InspectOptions, UnpackOptions, UnpackReport,
 };
 use crate::codec::{decode_entry_name_with_override, detect_archive_encoding, EntryEncodingFlags};
 use crate::error::{DandiError, Result};
-use crate::platform::{read_zone_identifier, to_fs_path};
+use crate::platform::read_zone_identifier;
 use crate::progress::{CancellationToken, ProgressEvent, ProgressObserver, ProgressPhase};
 use crate::safety::{is_os_junk, sanitize_entry_path, SafetyBudget};
 
@@ -129,10 +129,10 @@ fn open_tar_reader(
     budget: &SafetyBudget,
     cancel: CancellationToken,
 ) -> Result<(Box<dyn Read>, StreamErrorSlot, u64)> {
-    let fs_path = to_fs_path(archive_path);
-    let archive_file_size = fs::metadata(&fs_path).map(|m| m.len()).unwrap_or(1).max(1);
-    let file = File::open(&fs_path).map_err(|e| DandiError::io(archive_path, e))?;
-    let buffered = BufReader::with_capacity(STREAM_BUF_SIZE, file);
+    let vol_set = discover_volumes(archive_path)?;
+    let split_reader = SplitFileReader::open(&vol_set.volumes)?;
+    let archive_file_size = split_reader.total_len().max(1);
+    let buffered = BufReader::with_capacity(STREAM_BUF_SIZE, split_reader);
     let error_slot: StreamErrorSlot = Arc::new(Mutex::new(None));
 
     let raw: Box<dyn Read> = match fmt {
@@ -434,6 +434,8 @@ pub(crate) fn unpack_tar(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
