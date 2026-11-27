@@ -5,6 +5,9 @@ members = [
     "crates/dandi-cli",
     "crates/dandi-eval",
 ]
+exclude = [
+    "apps/desktop/src-tauri",
+]
 
 [workspace.package]
 version = "0.1.0"
