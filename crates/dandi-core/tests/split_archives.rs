@@ -769,10 +769,12 @@ fn stray_numbered_sibling_is_a_conflict_not_a_broken_set() {
         try_pack_split(&small, &out_dir.join("s.zip"), SplitStyle::Numeric, 6),
         "s.zip.099",
     );
-    // The refused pack left the earlier set intact and readable.
+    // The refused pack left the earlier set intact; readable once the stray is moved away.
+    assert_eq!(fs::read(&stray).unwrap(), b"not a volume");
     for vol in &report.output_volumes {
         assert!(vol.exists(), "{vol:?}");
     }
+    fs::rename(&stray, &moved).unwrap();
     let dest = tmp.path().join("x");
     unpack_direct(&report.output_volumes[0], &dest, None);
     assert_eq!(hash_tree(&dest.join("bundle")), hash_tree(&bundle));
