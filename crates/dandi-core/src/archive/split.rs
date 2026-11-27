@@ -92,7 +92,8 @@ pub(crate) fn discover_volumes(path: &Path) -> Result<VolumeSet> {
         .unwrap_or_else(|| Path::new("."));
 
     // 1. Check numeric split suffix (`.001`, `.002`, ..., `.0001`).
-    if let Some((base_name, width, clicked_part)) = parse_numeric_split_name(&file_name) {
+    if let Some((base_name, suffix_len, clicked_part)) = parse_numeric_split_name(&file_name) {
+        let width = numeric_set_width(parent, &base_name, suffix_len, clicked_part);
         let part1 = parent.join(format!("{base_name}.{:0width$}", 1));
         // A complete archive merely named like a later part (`report.zip.2024`) opens on its own.
         let standalone =
@@ -161,7 +162,34 @@ fn has_archive_magic(path: &Path) -> bool {
     crate::archive::format::detect_by_magic(&header[..n]).is_some()
 }
 
-fn discover_numeric_volumes(parent: &Path, base_name: &str, width: usize) -> Result<VolumeSet> {
+/// Width of the set a numeric part belongs to. A name that grew past its set's width (`.1000`
+/// after `.999`, as 7-Zip numbers parts) belongs to the narrower set whose run reaches it;
+/// otherwise the suffix length is the width.
+fn numeric_set_width(parent: &Path, base_name: &str, suffix_len: usize, part: usize) -> usize {
+    let exists =
+        |n: usize, w: usize| to_fs_path(&parent.join(format!("{base_name}.{n:0w$}"))).exists();
+    let grown = part.to_string().len() == suffix_len;
+    if grown && !exists(1, suffix_len) {
+        for w in (3..suffix_len).rev() {
+            let Some(first_grown) = first_grown_part(w) else {
+                continue;
+            };
+            if exists(1, w) && (first_grown - 1..=part).all(|n| exists(n, w)) {
+                return w;
+            }
+        }
+    }
+    suffix_len
+}
+
+/// First part number whose name outgrows `width` digits (`1000` for `.001`).
+fn first_grown_part(width: usize) -> Option<usize> {
+    10usize.checked_pow(u32::try_from(width).ok()?)
+}
+
+/// Sorted siblings `<base_name>.<n>` named exactly as part `n` of a set whose first volume is
+/// `<base_name>.{1:0width$}`: zero-padded to `width` digits, or longer once `n` outgrows it.
+fn numeric_siblings(parent: &Path, base_name: &str, width: usize) -> Result<Vec<(usize, PathBuf)>> {
     let prefix = format!("{base_name}.");
     let mut found: Vec<(usize, PathBuf)> = Vec::new();
 
@@ -170,11 +198,12 @@ fn discover_numeric_volumes(parent: &Path, base_name: &str, width: usize) -> Res
         let entry = entry_res.map_err(|e| DandiError::io(parent, e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(suffix) = name.strip_prefix(&prefix) {
-            if suffix.len() == width && suffix.bytes().all(|b| b.is_ascii_digit()) {
-                if let Ok(num) = suffix.parse::<usize>() {
-                    if num >= 1 {
-                        found.push((num, parent.join(name)));
-                    }
+            if !suffix.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            if let Ok(num) = suffix.parse::<usize>() {
+                if num >= 1 && suffix == format!("{num:0width$}") {
+                    found.push((num, parent.join(name)));
                 }
             }
         }
@@ -182,29 +211,43 @@ fn discover_numeric_volumes(parent: &Path, base_name: &str, width: usize) -> Res
 
     found.sort_by_key(|(num, _)| *num);
     found.dedup_by_key(|(num, _)| *num);
+    Ok(found)
+}
 
-    if found.is_empty() || found[0].0 != 1 {
-        let missing = parent.join(format!("{base_name}.{:0width$}", 1));
-        return Err(DandiError::CorruptArchive(format!(
-            "missing split volume '{}'",
-            missing.display()
-        )));
+/// Every fixed-width part up to the highest one found must exist, so a missing middle volume
+/// is named in the error. Grown names (`.1000`…) count only as the run continuing a full
+/// fixed-width range, so a look-alike such as `report.zip.2024` never joins a small set.
+fn discover_numeric_volumes(parent: &Path, base_name: &str, width: usize) -> Result<VolumeSet> {
+    let found = numeric_siblings(parent, base_name, width)?;
+    let first_grown = first_grown_part(width).unwrap_or(usize::MAX);
+    let fixed_len = found.partition_point(|(num, _)| *num < first_grown);
+    let (fixed, grown) = found.split_at(fixed_len);
+
+    let missing_volume = |num: usize| {
+        let missing = parent.join(format!("{base_name}.{num:0width$}"));
+        DandiError::CorruptArchive(format!("missing split volume '{}'", missing.display()))
+    };
+    let max_part = fixed.last().map_or(0, |(num, _)| *num);
+    if max_part == 0 {
+        return Err(missing_volume(1));
+    }
+    for (idx, (num, _)) in fixed.iter().enumerate() {
+        if *num != idx + 1 {
+            return Err(missing_volume(idx + 1));
+        }
     }
 
-    let max_part = found[found.len() - 1].0;
-    for expected in 1..=max_part {
-        if found.get(expected - 1).map(|(n, _)| *n) != Some(expected) {
-            let missing = parent.join(format!("{base_name}.{:0width$}", expected));
-            return Err(DandiError::CorruptArchive(format!(
-                "missing split volume '{}'",
-                missing.display()
-            )));
+    let mut volumes: Vec<PathBuf> = fixed.iter().map(|(_, p)| p.clone()).collect();
+    for (offset, (num, path)) in grown.iter().enumerate() {
+        if *num != max_part + 1 + offset {
+            break;
         }
+        volumes.push(path.clone());
     }
 
     Ok(VolumeSet {
         kind: VolumeKind::Numeric,
-        volumes: found.into_iter().map(|(_, p)| p).collect(),
+        volumes,
     })
 }
 
@@ -599,22 +642,68 @@ fn rename_volume(src: &Path, dst: &Path) -> Result<()> {
     fs::rename(&fs_src, &fs_dst).map_err(|e| DandiError::io(dst, e))
 }
 
-/// Leftover volumes of an older set at the same name: the run of consecutively numbered
-/// volumes right after the new set's last one (`.004`, `.005` after re-packing into three).
-/// Unrelated siblings such as `backup.zip.2024` or a lone `backup.z99` are never touched.
-fn stale_volumes_after(first_stale: u32, name_of: impl Fn(u32) -> Vec<PathBuf>) -> Vec<PathBuf> {
+/// Leftover disks of an older PKWARE set at the same name: the part of the run counting up
+/// from `.z01` that lies at or past `first_stale` (`.z03`, `.z04` after re-packing into three
+/// disks). Without `.z01` there is no older set, and names past a gap (`backup.z99`) are
+/// never touched.
+fn stale_pkware_volumes(output_zip: &Path, first_stale: u32) -> Vec<PathBuf> {
     let mut stale = Vec::new();
-    for idx in first_stale..MAX_SPLIT_VOLUMES {
-        let existing: Vec<PathBuf> = name_of(idx)
+    for idx in 1..MAX_SPLIT_VOLUMES {
+        let existing: Vec<PathBuf> = pkware_volume_names(output_zip, idx)
             .into_iter()
             .filter(|p| to_fs_path(p).is_file())
             .collect();
         if existing.is_empty() {
             break;
         }
-        stale.extend(existing);
+        if idx >= first_stale {
+            stale.extend(existing);
+        }
     }
     stale
+}
+
+/// Leftover volumes of an older numeric set at the same name: the members past `count` of the
+/// run counting up from `.001` (`.004`, `.005` after re-packing into three). Without `.001`
+/// there is no older set to clean up.
+///
+/// Any other sibling the reader would take for a volume of the new set (a stray `.099`, or a
+/// `.1000` next to a full `.001`…`.999` set) is a conflict: deleting it could lose user data and
+/// keeping it would leave a set that cannot be opened, so the pack is refused before commit.
+fn stale_numeric_volumes(output_base: &Path, count: usize, width: usize) -> Result<Vec<PathBuf>> {
+    let parent = output_base
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base_name = output_base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let siblings = numeric_siblings(parent, &base_name, width)?;
+
+    let old_len = siblings
+        .iter()
+        .enumerate()
+        .take_while(|(idx, (num, _))| *num == idx + 1)
+        .count();
+    let (old_set, others) = siblings.split_at(old_len);
+    let first_grown = first_grown_part(width).unwrap_or(usize::MAX);
+    if let Some((_, stray)) = others
+        .iter()
+        .find(|(num, _)| *num > count && (*num < first_grown || *num == count + 1))
+    {
+        return Err(DandiError::InvalidInput(format!(
+            "'{}' would be read as a volume of the new split set but is not part of an older set \
+             at that name; move or rename it, then pack again",
+            stray.display()
+        )));
+    }
+
+    Ok(old_set
+        .iter()
+        .filter(|(num, _)| *num > count)
+        .map(|(_, p)| p.clone())
+        .collect())
 }
 
 fn numeric_volume_name(output_base: &Path, idx: u32, width: usize) -> PathBuf {
@@ -813,9 +902,7 @@ impl SplitVolumeWriter {
         let final_paths: Vec<PathBuf> = (1..=count as u32)
             .map(|i| numeric_volume_name(output_base, i, width))
             .collect();
-        let stale = stale_volumes_after(count as u32 + 1, |i| {
-            vec![numeric_volume_name(output_base, i, width)]
-        });
+        let stale = stale_numeric_volumes(output_base, count, width)?;
 
         let mut staged = std::mem::take(&mut self.temp_paths);
         if let Err(err) = commit_staged_volumes(&mut staged, &final_paths, &stale, overwrite) {
@@ -1146,7 +1233,7 @@ impl PkwareSplitWriter {
         let num_disks = self.temp_paths.len();
         let final_paths = pkware_final_volume_paths(output_zip, num_disks);
         let first_stale = u32::try_from(num_disks).unwrap_or(MAX_SPLIT_VOLUMES);
-        let stale = stale_volumes_after(first_stale, |i| pkware_volume_names(output_zip, i));
+        let stale = stale_pkware_volumes(output_zip, first_stale);
 
         let mut staged = std::mem::take(&mut self.temp_paths);
         if let Err(err) = commit_staged_volumes(&mut staged, &final_paths, &stale, overwrite) {
