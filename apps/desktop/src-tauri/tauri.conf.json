@@ -1,0 +1,109 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Dandi",
+  "version": "0.1.0",
+  "identifier": "com.itp-adieum.dandi",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Dandi",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 520,
+        "center": true,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "copyright": "Copyright © ITP-Adieum",
+    "shortDescription": "Fast, cross-OS archiver that never breaks filenames.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["zip"],
+        "name": "ZIP Archive",
+        "description": "ZIP Archive",
+        "mimeType": "application/zip",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["7z"],
+        "name": "7-Zip Archive",
+        "description": "7-Zip Archive",
+        "mimeType": "application/x-7z-compressed",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["tar"],
+        "name": "TAR Archive",
+        "description": "TAR Archive",
+        "mimeType": "application/x-tar",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["tgz"],
+        "name": "Gzipped TAR Archive",
+        "description": "Gzipped TAR Archive",
+        "mimeType": "application/gzip",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["gz"],
+        "name": "Gzip Archive",
+        "description": "Gzip Archive",
+        "mimeType": "application/gzip",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["zst"],
+        "name": "Zstandard Archive",
+        "description": "Zstandard Archive",
+        "mimeType": "application/zstd",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["bz2"],
+        "name": "Bzip2 Archive",
+        "description": "Bzip2 Archive",
+        "mimeType": "application/x-bzip2",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["xz"],
+        "name": "XZ Archive",
+        "description": "XZ Archive",
+        "mimeType": "application/x-xz",
+        "role": "Viewer",
+        "rank": "Alternate"
+      }
+    ]
+  }
+}
