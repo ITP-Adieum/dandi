@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use dandi_core::{
-    inspect, unpack, ArchiveFormat, DandiError, EncodingId, EntryKind, ExtractMode, InspectOptions,
+    inspect, unpack, ArchiveFormat, DandiError, EncodingId, ExtractMode, InspectOptions,
     NoopProgressObserver, SafetyBudget, UnpackOptions,
 };
 use sha2::{Digest, Sha256};
@@ -299,7 +299,17 @@ fn rar4_and_rar5_inspect_and_unpack_through_the_sink() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        assert!((modified - MTIME).abs() <= 2, "{fixture}: mtime {modified}");
+        let drift = modified - MTIME;
+        if fixture.starts_with("rar5") {
+            assert!(drift.abs() <= 2, "{fixture}: mtime {modified}");
+        } else {
+            // RAR4 stores DOS local time without a zone (as WinRAR does), so the result shifts by
+            // the packer's and the reader's UTC offsets; only a whole-quarter-hour shift is valid.
+            assert!(
+                drift.abs() <= 28 * 3600 && drift.rem_euclid(900) <= 2,
+                "{fixture}: mtime {modified}"
+            );
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -334,7 +344,7 @@ fn rar5_relative_symlink_is_materialized_inside_destination() {
         .iter()
         .find(|e| e.path == "bundle/latest.txt")
         .unwrap();
-    assert_eq!(link.kind, EntryKind::Symlink);
+    assert_eq!(link.kind, dandi_core::EntryKind::Symlink);
 }
 
 #[test]

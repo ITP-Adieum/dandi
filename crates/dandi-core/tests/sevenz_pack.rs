@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use dandi_core::{
-    inspect, pack, unpack, CancellationToken, DandiError, EntryKind, ExtractMode, InspectOptions,
+    inspect, pack, unpack, CancellationToken, DandiError, ExtractMode, InspectOptions,
     NoopProgressObserver, PackFormat, PackOptions, PackReport, ProgressEvent, ProgressObserver,
     ProgressPhase, SafetyBudget, SplitStyle, UnpackOptions, MIN_SPLIT_SIZE_BYTES,
 };
@@ -270,7 +270,7 @@ fn pack_7z_keeps_exec_bits_and_relative_symlinks() {
         .iter()
         .find(|e| e.path == "Tool.app/Contents/launcher")
         .unwrap();
-    assert_eq!(link.kind, EntryKind::Symlink);
+    assert_eq!(link.kind, dandi_core::EntryKind::Symlink);
 
     let dest = tmp.path().join("x");
     let report = unpack(&out, &dest, &unpack_opts(None), &NoopProgressObserver).unwrap();
