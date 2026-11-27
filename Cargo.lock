@@ -370,7 +370,6 @@ dependencies = [
  "clap",
  "crc32fast",
  "dandi-core",
- "filetime",
  "flate2",
  "lzma-rust2 0.26.0",
  "serde",

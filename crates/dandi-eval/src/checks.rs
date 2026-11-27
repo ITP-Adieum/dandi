@@ -707,8 +707,7 @@ fn check_compat_04() -> Result<String, String> {
 
     // Explicit UTC timestamp: 2025-07-15 12:34:56 UTC
     let expected_ts: i64 = 1_752_582_896;
-    let ft = filetime::FileTime::from_unix_time(expected_ts, 0);
-    filetime::set_file_mtime(&src_file, ft).map_err(|e| e.to_string())?;
+    dandi_core::platform::set_mtime(&src_file, expected_ts, false).map_err(|e| e.to_string())?;
 
     let zip_path = tmp.path().join("ts.zip");
     pack(
@@ -749,7 +748,12 @@ fn check_compat_04() -> Result<String, String> {
 
     let unpacked_meta =
         fs::metadata(out_dir.join("timestamp_test.txt")).map_err(|e| e.to_string())?;
-    let actual_ts = filetime::FileTime::from_last_modification_time(&unpacked_meta).unix_seconds();
+    let actual_ts = unpacked_meta
+        .modified()
+        .map_err(|e| e.to_string())?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs() as i64;
     let drift = (actual_ts - expected_ts).abs();
     if drift > 2 {
         return Err(format!(

@@ -15,7 +15,6 @@ bzip2.workspace = true
 clap.workspace = true
 crc32fast.workspace = true
 dandi-core = { path = "../dandi-core" }
-filetime.workspace = true
 flate2.workspace = true
 lzma-rust2.workspace = true
 serde.workspace = true

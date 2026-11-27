@@ -152,6 +152,7 @@ pub fn create_relative_symlink(
 }
 
 /// Sets file modification time in UTC Unix seconds.
+#[allow(deprecated)]
 pub fn set_mtime(path: &Path, unix_secs: i64, is_symlink: bool) -> io::Result<()> {
     let fs_path = to_fs_path(path);
     let ft = filetime::FileTime::from_unix_time(unix_secs, 0);
