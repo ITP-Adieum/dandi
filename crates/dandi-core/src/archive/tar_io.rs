@@ -69,7 +69,7 @@ impl<R: Read> BudgetedReader<R> {
                 *guard = Some(err);
             }
         }
-        io::Error::new(io::ErrorKind::Interrupted, msg)
+        io::Error::other(msg)
     }
 }
 
@@ -168,6 +168,7 @@ fn open_tar_reader(
     Ok((Box::new(wrapped), error_slot, archive_file_size))
 }
 
+#[derive(Debug)]
 struct TarMetaEntry {
     index: usize,
     raw_name: Vec<u8>,
@@ -591,5 +592,71 @@ fn strip_prefix(normalized: &str, prefix: Option<&str>) -> String {
             .unwrap_or(normalized)
             .to_string(),
         None => normalized.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tempfile::TempDir;
+
+    #[test]
+    fn tar_budgeted_reader_trips_during_body_skip_without_hanging() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("skip_body_bomb.tar.gz");
+        {
+            let file = File::create(&path).unwrap();
+            let gz = GzEncoder::new(file, Compression::fast());
+            let mut builder = tar::Builder::new(gz);
+            for i in 0..2 {
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_entry_type(tar::EntryType::Regular);
+                hdr.set_size(4 * 1024 * 1024);
+                hdr.set_mode(0o644);
+                hdr.set_mtime(1_735_689_600);
+                hdr.set_cksum();
+                let zero_reader = io::repeat(0u8).take(4 * 1024 * 1024);
+                builder
+                    .append_data(&mut hdr, format!("z_{i}.bin"), zero_reader)
+                    .unwrap();
+            }
+            let gz = builder.into_inner().unwrap();
+            gz.finish().unwrap();
+        }
+
+        // 1. Directly iterate tar::Archive over BudgetedReader so tar's internal read_exact / io::copy
+        //    must skip entry 0's 4 MiB body and trip BudgetedReader::read() itself (would hang forever on EINTR).
+        let budget = SafetyBudget::new(100 * 1024 * 1024, 1000, 50.0, 2 * 1024 * 1024);
+        let cancel = CancellationToken::new();
+        let (reader, error_slot, _) =
+            open_tar_reader(&path, ArchiveFormat::TarGz, &budget, cancel).unwrap();
+        let mut tar_archive = Archive::new(reader);
+        let mut got_err: Option<DandiError> = None;
+        for entry_res in tar_archive.entries().unwrap() {
+            if let Err(e) = entry_res {
+                got_err = Some(take_stream_or_corrupt(&error_slot, e));
+                break;
+            }
+        }
+        assert!(
+            matches!(got_err, Some(DandiError::BudgetExceeded { .. })),
+            "expected BudgetedReader to return BudgetExceeded without hanging, got {got_err:?}"
+        );
+
+        // 2. Verify pre-cancelled token trips BudgetedReader::read() inside tar's read_exact immediately.
+        let pre_cancel = CancellationToken::new();
+        pre_cancel.cancel();
+        let res_cancel = scan_tar_metadata(
+            &path,
+            ArchiveFormat::TarGz,
+            &SafetyBudget::default(),
+            &pre_cancel,
+        );
+        assert!(
+            matches!(res_cancel, Err(DandiError::Cancelled)),
+            "expected Cancelled without hanging, got {res_cancel:?}"
+        );
     }
 }
