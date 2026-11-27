@@ -528,8 +528,20 @@ fn bsdtar_agrees_with_committed_rar_fixtures() {
         eprintln!("skipping: bsdtar not installed");
         return;
     };
-    if !probe.status.success() {
-        eprintln!("skipping: bsdtar not usable");
+    // libarchive 3.5.x mis-reads small RAR5 members ("Truncated data in huffman tables").
+    let text = String::from_utf8_lossy(&probe.stdout).into_owned();
+    let modern = text
+        .split("libarchive ")
+        .nth(1)
+        .and_then(|v| {
+            v.split('.')
+                .take(2)
+                .map(|p| p.parse::<u32>().ok())
+                .collect::<Option<Vec<_>>>()
+        })
+        .is_some_and(|v| v.len() == 2 && (v[0] > 3 || (v[0] == 3 && v[1] >= 6)));
+    if !probe.status.success() || !modern {
+        eprintln!("skipping: bsdtar is not libarchive >= 3.6 ({text})");
         return;
     }
     for fixture in ["rar4_basic.rar", "rar5_basic.rar"] {
