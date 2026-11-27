@@ -1,6 +1,6 @@
 import type {
   ArchiveSummary,
-  CommandError,
+  ErrorKind,
   ExtractMode,
   ProgressPayload,
 } from "../types";
@@ -20,6 +20,8 @@ export interface PasswordPromptState {
   archivePath: string;
   invalidAttempt: boolean;
   destPath?: string;
+  selectedOnly?: boolean;
+  encodingOverride?: string | null;
 }
 
 export interface BannerNotice {
@@ -39,6 +41,8 @@ export interface PackDraftState {
 
 export interface DesktopState {
   archivePath: string | null;
+  pendingArchivePath: string | null;
+  pendingEncodingOverride: string | null;
   summary: ArchiveSummary | null;
   loadingArchive: boolean;
   encodingOverride: string | null;
@@ -57,6 +61,8 @@ export interface DesktopState {
 
 export const INITIAL_DESKTOP_STATE: DesktopState = {
   archivePath: null,
+  pendingArchivePath: null,
+  pendingEncodingOverride: null,
   summary: null,
   loadingArchive: false,
   encodingOverride: null,
@@ -75,9 +81,21 @@ export const INITIAL_DESKTOP_STATE: DesktopState = {
 
 export type DesktopAction =
   | { type: "inspect_start"; archivePath: string; encodingOverride: string | null }
-  | { type: "inspect_success"; archivePath: string; summary: ArchiveSummary; password: string | null }
-  | { type: "inspect_error"; error: CommandError }
+  | {
+      type: "inspect_success";
+      archivePath: string;
+      summary: ArchiveSummary;
+      encodingOverride: string | null;
+      password: string | null;
+    }
+  | {
+      type: "inspect_error";
+      archivePath: string;
+      errorKind: ErrorKind;
+      notice: BannerNotice;
+    }
   | { type: "close_archive" }
+  | { type: "set_archive_password"; password: string | null }
   | { type: "set_show_os_junk"; value: boolean }
   | { type: "set_extract_mode"; mode: ExtractMode }
   | { type: "set_reveal_after"; value: boolean }
@@ -97,57 +115,62 @@ export type DesktopAction =
 
 export function desktopReducer(state: DesktopState, action: DesktopAction): DesktopState {
   switch (action.type) {
-    case "inspect_start": {
+    case "inspect_start":
+      return {
+        ...state,
+        pendingArchivePath: action.archivePath,
+        pendingEncodingOverride: action.encodingOverride,
+        loadingArchive: true,
+        notice: null,
+      };
+    case "inspect_success": {
       const sameArchive = state.archivePath === action.archivePath;
       return {
         ...state,
         archivePath: action.archivePath,
-        loadingArchive: true,
+        pendingArchivePath: null,
+        pendingEncodingOverride: null,
+        summary: action.summary,
+        loadingArchive: false,
         encodingOverride: action.encodingOverride,
-        archivePassword: sameArchive ? state.archivePassword : null,
+        archivePassword: action.password,
         activeFolder: sameArchive ? state.activeFolder : "",
         searchQuery: sameArchive ? state.searchQuery : "",
         selectedIndices: sameArchive ? state.selectedIndices : [],
-        notice: null,
-      };
-    }
-    case "inspect_success":
-      return {
-        ...state,
-        archivePath: action.archivePath,
-        summary: action.summary,
-        loadingArchive: false,
-        archivePassword: action.password,
         passwordPrompt: null,
       };
+    }
     case "inspect_error": {
       const needsPassword =
-        action.error.kind === "password_required" || action.error.kind === "invalid_password";
-      if (needsPassword && state.archivePath) {
+        action.errorKind === "password_required" || action.errorKind === "invalid_password";
+      if (needsPassword) {
         return {
           ...state,
           loadingArchive: false,
           passwordPrompt: {
             purpose: "inspect",
-            archivePath: state.archivePath,
-            invalidAttempt: action.error.kind === "invalid_password",
+            archivePath: action.archivePath,
+            invalidAttempt: action.errorKind === "invalid_password",
+            encodingOverride: state.pendingEncodingOverride,
           },
+          pendingArchivePath: null,
+          pendingEncodingOverride: null,
         };
       }
       return {
         ...state,
         loadingArchive: false,
-        notice: {
-          tone: "error",
-          title: action.error.kind,
-          detail: action.error.message,
-        },
+        pendingArchivePath: null,
+        pendingEncodingOverride: null,
+        notice: action.notice,
       };
     }
     case "close_archive":
       return {
         ...state,
         archivePath: null,
+        pendingArchivePath: null,
+        pendingEncodingOverride: null,
         summary: null,
         loadingArchive: false,
         encodingOverride: null,
@@ -156,6 +179,8 @@ export function desktopReducer(state: DesktopState, action: DesktopAction): Desk
         searchQuery: "",
         selectedIndices: [],
       };
+    case "set_archive_password":
+      return { ...state, archivePassword: action.password };
     case "set_show_os_junk":
       return { ...state, showOsJunk: action.value };
     case "set_extract_mode":
@@ -178,7 +203,12 @@ export function desktopReducer(state: DesktopState, action: DesktopAction): Desk
     case "open_password_prompt":
       return { ...state, passwordPrompt: action.prompt };
     case "close_password_prompt":
-      return { ...state, passwordPrompt: null };
+      return {
+        ...state,
+        passwordPrompt: null,
+        pendingArchivePath: null,
+        pendingEncodingOverride: null,
+      };
     case "operation_start":
       return {
         ...state,

@@ -10,10 +10,26 @@ use crate::state::AppState;
 
 const EVENT_OPEN_PATHS: &str = "dandi://open-paths";
 
-fn extract_existing_paths<'a>(args: impl Iterator<Item = &'a str>) -> Vec<String> {
+fn extract_existing_paths<'a>(
+    args: impl Iterator<Item = &'a str>,
+    base_dir: Option<&Path>,
+) -> Vec<String> {
     args.filter(|arg| !arg.starts_with('-') && !arg.trim().is_empty())
-        .filter(|arg| Path::new(arg).exists())
-        .map(ToString::to_string)
+        .filter_map(|arg| {
+            let p = Path::new(arg);
+            let candidate = if p.is_absolute() {
+                p.to_path_buf()
+            } else if let Some(cwd) = base_dir {
+                cwd.join(p)
+            } else {
+                p.to_path_buf()
+            };
+            if candidate.exists() {
+                Some(candidate.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -21,10 +37,13 @@ fn dispatch_open_paths(app: &AppHandle, paths: Vec<String>) {
     if paths.is_empty() {
         return;
     }
-    if let Some(state) = app.try_state::<AppState>() {
-        state.push_pending_open_paths(paths.clone());
+    let should_emit = match app.try_state::<AppState>() {
+        Some(state) => state.enqueue_or_should_emit(paths.clone()),
+        None => true,
+    };
+    if should_emit {
+        let _ = app.emit(EVENT_OPEN_PATHS, paths);
     }
-    let _ = app.emit(EVENT_OPEN_PATHS, paths);
     focus_main_window(app);
 }
 
@@ -45,8 +64,13 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            let paths = extract_existing_paths(argv.iter().skip(1).map(String::as_str));
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            let base = if cwd.trim().is_empty() {
+                None
+            } else {
+                Some(Path::new(&cwd))
+            };
+            let paths = extract_existing_paths(argv.iter().skip(1).map(String::as_str), base);
             if !paths.is_empty() {
                 dispatch_open_paths(app, paths);
             } else {
@@ -58,10 +82,12 @@ pub fn run() {
     let app_result = builder
         .setup(|app| {
             let startup_args: Vec<String> = std::env::args().skip(1).collect();
-            let paths = extract_existing_paths(startup_args.iter().map(String::as_str));
+            let cwd = std::env::current_dir().ok();
+            let paths =
+                extract_existing_paths(startup_args.iter().map(String::as_str), cwd.as_deref());
             if !paths.is_empty() {
                 if let Some(state) = app.try_state::<AppState>() {
-                    state.push_pending_open_paths(paths);
+                    let _ = state.enqueue_or_should_emit(paths);
                 }
             }
             Ok(())
@@ -102,4 +128,21 @@ pub fn run() {
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let _ = (app_handle, event);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn extract_existing_paths_resolves_relative_args_against_cwd() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("sample.zip");
+        std::fs::write(&file, b"PK").unwrap();
+
+        let args = ["--flag", "sample.zip", "missing.zip"];
+        let found = extract_existing_paths(args.into_iter(), Some(dir.path()));
+        assert_eq!(found, vec![file.to_string_lossy().into_owned()]);
+    }
 }

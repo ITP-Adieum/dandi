@@ -117,6 +117,9 @@ export default function App() {
     [t]
   );
 
+  const formatErrorNoticeRef = useRef(formatErrorNotice);
+  formatErrorNoticeRef.current = formatErrorNotice;
+
   const runInspect = useCallback(
     async (
       archivePath: string,
@@ -132,11 +135,17 @@ export default function App() {
           type: "inspect_success",
           archivePath,
           summary,
+          encodingOverride,
           password,
         });
       } catch (err) {
         const cmdErr = toCommandError(err);
-        dispatch({ type: "inspect_error", error: cmdErr });
+        dispatch({
+          type: "inspect_error",
+          archivePath,
+          errorKind: cmdErr.kind,
+          notice: formatErrorNoticeRef.current(cmdErr.kind, cmdErr.message),
+        });
       }
     },
     []
@@ -177,61 +186,76 @@ export default function App() {
         const cmdErr = toCommandError(err);
         dispatch({
           type: "set_notice",
-          notice: formatErrorNotice(cmdErr.kind, cmdErr.message),
+          notice: formatErrorNoticeRef.current(cmdErr.kind, cmdErr.message),
         });
       }
     },
-    [formatErrorNotice, openPackWithInputs, runInspect]
+    [openPackWithInputs, runInspect]
   );
 
-  // Wire native Tauri v2 drag-and-drop & OS file association open events.
+  const handleIncomingPathsRef = useRef(handleIncomingPaths);
+  handleIncomingPathsRef.current = handleIncomingPaths;
+
+  // Wire native Tauri v2 drag-and-drop & OS file association open events exactly once.
   useEffect(() => {
+    let disposed = false;
     let unlistenDrop: (() => void) | undefined;
     let unlistenOpen: (() => void) | undefined;
 
-    getCurrentWebview()
-      .onDragDropEvent((event) => {
-        if (event.payload.type === "enter" || event.payload.type === "over") {
-          setDragActive(true);
-        } else if (event.payload.type === "leave") {
-          setDragActive(false);
-        } else if (event.payload.type === "drop") {
-          setDragActive(false);
-          void handleIncomingPaths(event.payload.paths);
+    const setup = async () => {
+      try {
+        const dropUnlisten = await getCurrentWebview().onDragDropEvent((event) => {
+          if (event.payload.type === "enter" || event.payload.type === "over") {
+            setDragActive(true);
+          } else if (event.payload.type === "leave") {
+            setDragActive(false);
+          } else if (event.payload.type === "drop") {
+            setDragActive(false);
+            void handleIncomingPathsRef.current(event.payload.paths);
+          }
+        });
+        if (disposed) {
+          dropUnlisten();
+          return;
         }
-      })
-      .then((fn) => {
-        unlistenDrop = fn;
-      })
-      .catch(() => {
+        unlistenDrop = dropUnlisten;
+      } catch {
         // non-Tauri browser preview fallback
-      });
+      }
 
-    listen<string[]>("dandi://open-paths", (event) => {
-      void handleIncomingPaths(event.payload);
-    })
-      .then((fn) => {
-        unlistenOpen = fn;
-      })
-      .catch(() => {
-        // ignore outside Tauri
-      });
-
-    takePendingOpenPaths()
-      .then((paths) => {
-        if (paths.length > 0) {
-          void handleIncomingPaths(paths);
+      try {
+        const openUnlisten = await listen<string[]>("dandi://open-paths", (event) => {
+          void handleIncomingPathsRef.current(event.payload);
+        });
+        if (disposed) {
+          openUnlisten();
+          return;
         }
-      })
-      .catch(() => {
+        unlistenOpen = openUnlisten;
+      } catch {
         // ignore outside Tauri
-      });
+      }
+
+      if (disposed) return;
+
+      try {
+        const paths = await takePendingOpenPaths();
+        if (!disposed && paths.length > 0) {
+          void handleIncomingPathsRef.current(paths);
+        }
+      } catch {
+        // ignore outside Tauri
+      }
+    };
+
+    void setup();
 
     return () => {
+      disposed = true;
       unlistenDrop?.();
       unlistenOpen?.();
     };
-  }, [handleIncomingPaths]);
+  }, []);
 
   const handleOpenArchiveDialog = async () => {
     const picked = await pickArchiveFile();
@@ -291,6 +315,9 @@ export default function App() {
         },
         (payload) => dispatch({ type: "operation_progress", payload })
       );
+      if (passwordOverride && archivePath === stateRef.current.archivePath) {
+        dispatch({ type: "set_archive_password", password: passwordOverride });
+      }
       const collisionNote =
         report.renamed_collisions.length > 0
           ? t.collisionsRenamed(report.renamed_collisions.length)
@@ -314,6 +341,7 @@ export default function App() {
             purpose: "unpack",
             archivePath,
             destPath: destDir,
+            selectedOnly,
             invalidAttempt: cmdErr.kind === "invalid_password",
           },
         });
@@ -362,6 +390,9 @@ export default function App() {
         opId,
         (payload) => dispatch({ type: "operation_progress", payload })
       );
+      if (passwordOverride && srcZip === stateRef.current.archivePath) {
+        dispatch({ type: "set_archive_password", password: passwordOverride });
+      }
       dispatch({
         type: "operation_finish",
         notice: {
@@ -462,10 +493,14 @@ export default function App() {
     const prompt = state.passwordPrompt;
     if (!prompt) return;
     if (prompt.purpose === "inspect") {
-      await runInspect(prompt.archivePath, state.encodingOverride, password, state.showOsJunk);
+      await runInspect(
+        prompt.archivePath,
+        prompt.encodingOverride ?? null,
+        password,
+        state.showOsJunk
+      );
     } else if (prompt.purpose === "unpack" && prompt.destPath) {
-      const selectedOnly = state.selectedIndices.length > 0;
-      await runUnpack(prompt.archivePath, prompt.destPath, selectedOnly, password);
+      await runUnpack(prompt.archivePath, prompt.destPath, prompt.selectedOnly ?? false, password);
     } else if (prompt.purpose === "fix" && prompt.destPath) {
       await runFixEncoding(prompt.archivePath, prompt.destPath, password);
     }
@@ -513,6 +548,16 @@ export default function App() {
     if (picked) {
       dispatch({ type: "update_pack_draft", patch: { outputZip: picked } });
     }
+  };
+
+  const handleRevealPath = (path: string) => {
+    void revealInFileManager(path).catch((err) => {
+      const cmdErr = toCommandError(err);
+      dispatch({
+        type: "set_notice",
+        notice: formatErrorNotice(cmdErr.kind, cmdErr.message),
+      });
+    });
   };
 
   const cycleTheme = () => {
@@ -585,7 +630,7 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   if (state.notice?.revealPath) {
-                    void revealInFileManager(state.notice.revealPath);
+                    handleRevealPath(state.notice.revealPath);
                   }
                 }}
                 className="inline-flex items-center gap-1 rounded border border-current/30 px-2 py-0.5 text-[11px] font-medium hover:bg-black/5"
@@ -665,6 +710,7 @@ export default function App() {
         <PasswordModal
           t={t}
           prompt={state.passwordPrompt}
+          busy={busy}
           onSubmit={(pwd) => void handlePasswordSubmit(pwd)}
           onClose={() => dispatch({ type: "close_password_prompt" })}
         />

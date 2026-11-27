@@ -17,22 +17,33 @@ const SAMPLE_SUMMARY: ArchiveSummary = {
   entries: [],
 };
 
+const OTHER_SUMMARY: ArchiveSummary = {
+  ...SAMPLE_SUMMARY,
+  applied_encoding: "utf8",
+  total_entries: 5,
+};
+
 describe("desktopReducer state transitions", () => {
-  it("handles inspect start, success, and encoding re-inspect preserving selection", () => {
+  it("commits archivePath only on inspect_success and preserves selection on re-inspect", () => {
     let s = desktopReducer(INITIAL_DESKTOP_STATE, {
       type: "inspect_start",
       archivePath: "/tmp/sample.zip",
       encodingOverride: null,
     });
     expect(s.loadingArchive).toBe(true);
+    expect(s.pendingArchivePath).toBe("/tmp/sample.zip");
+    expect(s.archivePath).toBeNull();
 
     s = desktopReducer(s, {
       type: "inspect_success",
       archivePath: "/tmp/sample.zip",
       summary: SAMPLE_SUMMARY,
+      encodingOverride: null,
       password: null,
     });
     expect(s.loadingArchive).toBe(false);
+    expect(s.archivePath).toBe("/tmp/sample.zip");
+    expect(s.pendingArchivePath).toBeNull();
     expect(s.summary?.applied_encoding).toBe("cp949");
 
     s = desktopReducer(s, { type: "set_selected_indices", indices: [0, 1] });
@@ -42,19 +53,92 @@ describe("desktopReducer state transitions", () => {
       archivePath: "/tmp/sample.zip",
       encodingOverride: "shift_jis",
     });
+    s = desktopReducer(s, {
+      type: "inspect_success",
+      archivePath: "/tmp/sample.zip",
+      summary: SAMPLE_SUMMARY,
+      encodingOverride: "shift_jis",
+      password: null,
+    });
     expect(s.encodingOverride).toBe("shift_jis");
     expect(s.selectedIndices).toEqual([0, 1]);
 
-    // Switching to a different archive resets selection
+    // Switching to a different archive resets selection on success
     s = desktopReducer(s, {
       type: "inspect_start",
       archivePath: "/tmp/other.zip",
       encodingOverride: null,
     });
+    s = desktopReducer(s, {
+      type: "inspect_success",
+      archivePath: "/tmp/other.zip",
+      summary: OTHER_SUMMARY,
+      encodingOverride: null,
+      password: null,
+    });
+    expect(s.archivePath).toBe("/tmp/other.zip");
     expect(s.selectedIndices).toEqual([]);
   });
 
-  it("opens password prompt on password_required and flags retry on invalid_password", () => {
+  it("preserves prior archive state when opening a second archive fails or password modal is cancelled", () => {
+    let s = desktopReducer(INITIAL_DESKTOP_STATE, {
+      type: "inspect_success",
+      archivePath: "/tmp/archive-a.zip",
+      summary: SAMPLE_SUMMARY,
+      encodingOverride: "cp949",
+      password: "secret",
+    });
+    s = desktopReducer(s, { type: "set_selected_indices", indices: [0] });
+
+    // Attempt to open corrupt archive B
+    s = desktopReducer(s, {
+      type: "inspect_start",
+      archivePath: "/tmp/corrupt-b.zip",
+      encodingOverride: null,
+    });
+    expect(s.archivePath).toBe("/tmp/archive-a.zip");
+    expect(s.pendingArchivePath).toBe("/tmp/corrupt-b.zip");
+
+    s = desktopReducer(s, {
+      type: "inspect_error",
+      archivePath: "/tmp/corrupt-b.zip",
+      errorKind: "corrupt_archive",
+      notice: {
+        tone: "error",
+        title: "Archive appears corrupt or truncated",
+        detail: "bad central directory",
+      },
+    });
+    expect(s.archivePath).toBe("/tmp/archive-a.zip");
+    expect(s.summary).toBe(SAMPLE_SUMMARY);
+    expect(s.encodingOverride).toBe("cp949");
+    expect(s.selectedIndices).toEqual([0]);
+    expect(s.pendingArchivePath).toBeNull();
+    expect(s.notice?.title).toBe("Archive appears corrupt or truncated");
+
+    // Attempt to open encrypted archive C, then cancel password modal
+    s = desktopReducer(s, {
+      type: "inspect_start",
+      archivePath: "/tmp/encrypted-c.zip",
+      encodingOverride: null,
+    });
+    s = desktopReducer(s, {
+      type: "inspect_error",
+      archivePath: "/tmp/encrypted-c.zip",
+      errorKind: "password_required",
+      notice: { tone: "error", title: "Password required" },
+    });
+    expect(s.passwordPrompt?.archivePath).toBe("/tmp/encrypted-c.zip");
+    expect(s.archivePath).toBe("/tmp/archive-a.zip");
+
+    s = desktopReducer(s, { type: "close_password_prompt" });
+    expect(s.passwordPrompt).toBeNull();
+    expect(s.pendingArchivePath).toBeNull();
+    expect(s.archivePath).toBe("/tmp/archive-a.zip");
+    expect(s.summary).toBe(SAMPLE_SUMMARY);
+  });
+
+  it("opens password prompt on password_required, flags retry on invalid_password, and preserves selectedOnly", () => {
     let s = desktopReducer(INITIAL_DESKTOP_STATE, {
       type: "inspect_start",
       archivePath: "/tmp/secret.zip",
@@ -62,16 +146,38 @@ describe("desktopReducer state transitions", () => {
     });
     s = desktopReducer(s, {
       type: "inspect_error",
-      error: { kind: "password_required", message: "encrypted" },
+      archivePath: "/tmp/secret.zip",
+      errorKind: "password_required",
+      notice: { tone: "error", title: "Password required" },
     });
     expect(s.passwordPrompt?.purpose).toBe("inspect");
     expect(s.passwordPrompt?.invalidAttempt).toBe(false);
 
     s = desktopReducer(s, {
       type: "inspect_error",
-      error: { kind: "invalid_password", message: "wrong password" },
+      archivePath: "/tmp/secret.zip",
+      errorKind: "invalid_password",
+      notice: { tone: "error", title: "Incorrect password" },
     });
     expect(s.passwordPrompt?.invalidAttempt).toBe(true);
+
+    // User has selected entries, but clicked "Extract All" (selectedOnly: false)
+    s = desktopReducer(s, { type: "set_selected_indices", indices: [0, 1] });
+    s = desktopReducer(s, {
+      type: "open_password_prompt",
+      prompt: {
+        purpose: "unpack",
+        archivePath: "/tmp/secret.zip",
+        destPath: "/tmp/out",
+        selectedOnly: false,
+        invalidAttempt: false,
+      },
+    });
+    expect(s.passwordPrompt?.selectedOnly).toBe(false);
+
+    // Caching verified password updates archivePassword
+    s = desktopReducer(s, { type: "set_archive_password", password: "correct-horse" });
+    expect(s.archivePassword).toBe("correct-horse");
   });
 
   it("tracks active operation progress, cancellation, and completion notice", () => {

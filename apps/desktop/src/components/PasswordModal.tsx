@@ -7,6 +7,7 @@ import type { PasswordPromptState } from "../lib/state";
 interface PasswordModalProps {
   t: Dictionary;
   prompt: PasswordPromptState;
+  busy?: boolean;
   onSubmit: (password: string) => void;
   onClose: () => void;
 }
@@ -14,6 +15,7 @@ interface PasswordModalProps {
 export function PasswordModal({
   t,
   prompt,
+  busy = false,
   onSubmit,
   onClose,
 }: PasswordModalProps) {
@@ -28,7 +30,7 @@ export function PasswordModal({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!password) return;
+    if (!password || busy) return;
     onSubmit(password);
   };
 
@@ -54,8 +56,9 @@ export function PasswordModal({
           </div>
           <button
             type="button"
+            disabled={busy}
             onClick={onClose}
-            className="rounded p-1 hover:bg-[var(--bg-hover)]"
+            className="rounded p-1 hover:bg-[var(--bg-hover)] disabled:opacity-45"
             style={{ color: "var(--text-muted)" }}
             aria-label={t.close}
           >
@@ -92,9 +95,10 @@ export function PasswordModal({
             ref={inputRef}
             type={visible ? "text" : "password"}
             value={password}
+            disabled={busy}
             onChange={(e) => setPassword(e.target.value)}
             placeholder="••••••••"
-            className="w-full rounded-md border py-2 pl-3 pr-9 text-xs outline-none focus:border-[var(--accent)]"
+            className="w-full rounded-md border py-2 pl-3 pr-9 text-xs outline-none focus:border-[var(--accent)] disabled:opacity-60"
             style={{
               backgroundColor: "var(--bg-app)",
               borderColor: prompt.invalidAttempt ? "var(--danger-border)" : "var(--border-strong)",
@@ -103,6 +107,7 @@ export function PasswordModal({
           />
           <button
             type="button"
+            disabled={busy}
             onClick={() => setVisible((v) => !v)}
             className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 hover:bg-[var(--bg-hover)]"
             style={{ color: "var(--text-muted)" }}
@@ -115,15 +120,16 @@ export function PasswordModal({
         <div className="mt-4 flex justify-end gap-2">
           <button
             type="button"
+            disabled={busy}
             onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-[var(--bg-hover)]"
+            className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-[var(--bg-hover)] disabled:opacity-45"
             style={{ borderColor: "var(--border-subtle)" }}
           >
             {t.cancel}
           </button>
           <button
             type="submit"
-            disabled={!password}
+            disabled={!password || busy}
             className="rounded-md px-3.5 py-1.5 text-xs font-medium text-white hover:brightness-105 disabled:opacity-45"
             style={{ backgroundColor: "var(--accent)" }}
           >

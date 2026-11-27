@@ -208,6 +208,33 @@ pub(crate) fn unpack_archive_impl(
     unpack(archive_path, dest_dir, &opts, observer).map_err(CommandError::from)
 }
 
+fn resolve_comparable_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if let (Ok(canon_parent), Some(name)) = (std::fs::canonicalize(parent), path.file_name()) {
+        return canon_parent.join(name);
+    }
+    path.to_path_buf()
+}
+
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    let ra = resolve_comparable_path(a);
+    let rb = resolve_comparable_path(b);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        ra.to_string_lossy().to_lowercase() == rb.to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        ra == rb
+    }
+}
+
 pub(crate) fn fix_archive_encoding_impl(
     src_zip: &Path,
     dst_zip: &Path,
@@ -215,6 +242,11 @@ pub(crate) fn fix_archive_encoding_impl(
     cancel: CancellationToken,
     observer: &dyn ProgressObserver,
 ) -> Result<RepackReport, CommandError> {
+    if paths_refer_to_same_file(src_zip, dst_zip) {
+        return Err(CommandError::invalid_input(
+            "Destination ZIP must be a different file from the source archive",
+        ));
+    }
     let opts = RepackOptions {
         encoding_override: parse_encoding_override(options.encoding_override)?,
         password: normalize_password(options.password),
@@ -261,7 +293,10 @@ pub(crate) fn default_output_path_impl(
         .ok_or_else(|| CommandError::invalid_input("missing input path"))?;
 
     let path = Path::new(first);
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
 
     let out = match kind {
         OutputPathKind::ExtractDir => parent.to_path_buf(),
@@ -590,5 +625,39 @@ mod tests {
         )
         .unwrap();
         assert!(multi_pack.ends_with("Archive.zip"));
+
+        // Bare relative filename must fall back to "." instead of empty parent.
+        let bare = "bare.zip".to_string();
+        let bare_ext =
+            default_output_path_impl(std::slice::from_ref(&bare), OutputPathKind::ExtractDir)
+                .unwrap();
+        assert_eq!(bare_ext, ".");
+    }
+
+    #[test]
+    fn fix_archive_encoding_rejects_in_place_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let src_file = dir.path().join("hello.txt");
+        std::fs::write(&src_file, "hello").unwrap();
+        let zip_path = dir.path().join("original.zip");
+        pack_archive_impl(
+            &[src_file],
+            &zip_path,
+            PackRequestOptions::default(),
+            CancellationToken::new(),
+            &NoopProgressObserver,
+        )
+        .unwrap();
+
+        let err = fix_archive_encoding_impl(
+            &zip_path,
+            &zip_path,
+            FixRequestOptions::default(),
+            CancellationToken::new(),
+            &NoopProgressObserver,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+        assert!(err.message.contains("different file"));
     }
 }

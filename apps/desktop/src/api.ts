@@ -14,7 +14,19 @@ import type {
   UnpackRequestOptions,
 } from "./types";
 
-export const ARCHIVE_EXTENSIONS = ["zip", "7z", "tar", "tgz", "gz", "zst", "bz2", "xz"];
+export const ARCHIVE_EXTENSIONS = [
+  "zip",
+  "7z",
+  "tar",
+  "tgz",
+  "gz",
+  "zst",
+  "tzst",
+  "bz2",
+  "tbz2",
+  "xz",
+  "txz",
+];
 
 export function isCommandError(err: unknown): err is CommandError {
   return (

@@ -1,12 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default desktop capabilities for Dandi",
+  "description": "Minimal desktop capabilities for Dandi",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "dialog:default",
-    "opener:default",
-    "opener:allow-reveal-item-in-dir"
+    "dialog:default"
   ]
 }

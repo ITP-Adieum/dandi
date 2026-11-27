@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dandi_core::CancellationToken;
@@ -8,6 +9,7 @@ use dandi_core::CancellationToken;
 pub struct AppState {
     operations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     pending_open_paths: Mutex<Vec<String>>,
+    frontend_ready: AtomicBool,
 }
 
 /// RAII guard that removes an operation's cancellation handle when the task ends.
@@ -75,24 +77,43 @@ impl AppState {
         guard.len()
     }
 
-    /// Queues paths opened via OS file associations or CLI args until the frontend collects them.
-    pub fn push_pending_open_paths(&self, paths: Vec<String>) {
+    /// Returns whether the frontend has registered its event listener and drained startup paths.
+    #[cfg(test)]
+    pub fn is_frontend_ready(&self) -> bool {
+        self.frontend_ready.load(Ordering::SeqCst)
+    }
+
+    /// Queues startup/OS-opened paths while the frontend is not yet ready.
+    ///
+    /// Synchronized on `pending_open_paths` with `take_pending_open_paths` so a path is
+    /// guaranteed to be delivered either via the drained queue OR via a live event — never
+    /// dropped and never delivered twice.
+    ///
+    /// Returns `true` if the frontend is already ready (caller should emit the live event),
+    /// or `false` if the paths were queued for startup drain (caller must not emit).
+    pub fn enqueue_or_should_emit(&self, paths: Vec<String>) -> bool {
         if paths.is_empty() {
-            return;
+            return false;
         }
         let mut guard = match self.pending_open_paths.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.extend(paths);
+        if self.frontend_ready.load(Ordering::SeqCst) {
+            true
+        } else {
+            guard.extend(paths);
+            false
+        }
     }
 
-    /// Drains and returns all queued OS-opened paths.
+    /// Marks the frontend ready and atomically drains all queued OS-opened paths.
     pub fn take_pending_open_paths(&self) -> Vec<String> {
         let mut guard = match self.pending_open_paths.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        self.frontend_ready.store(true, Ordering::SeqCst);
         std::mem::take(&mut *guard)
     }
 }
@@ -123,13 +144,22 @@ mod tests {
     }
 
     #[test]
-    fn pending_open_paths_queue_and_drain() {
+    fn frontend_ready_gating_prevents_duplicate_delivery() {
         let state = AppState::new();
+        assert!(!state.is_frontend_ready());
+
+        // Before frontend is ready, incoming paths are queued and NOT emitted.
+        assert!(!state.enqueue_or_should_emit(vec!["/tmp/a.zip".into()]));
+        assert!(!state.enqueue_or_should_emit(vec!["/tmp/b.7z".into()]));
+
+        // Draining flips frontend_ready to true and returns queued paths once.
+        let drained = state.take_pending_open_paths();
+        assert!(state.is_frontend_ready());
+        assert_eq!(drained, vec!["/tmp/a.zip", "/tmp/b.7z"]);
         assert!(state.take_pending_open_paths().is_empty());
 
-        state.push_pending_open_paths(vec!["/tmp/a.zip".into(), "/tmp/b.7z".into()]);
-        let drained = state.take_pending_open_paths();
-        assert_eq!(drained, vec!["/tmp/a.zip", "/tmp/b.7z"]);
+        // After frontend is ready, incoming paths signal live emit and are NOT queued.
+        assert!(state.enqueue_or_should_emit(vec!["/tmp/c.zip".into()]));
         assert!(state.take_pending_open_paths().is_empty());
     }
 }
