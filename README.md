@@ -2,7 +2,7 @@
 
 > **Fast, open-source macOS & Windows archiver that never breaks filenames.**
 >
-> *Dandi (단디)* is a Korean dialect word meaning **"tightly, properly, without a hitch"** — and sounds just like English **"dandy"**.
+> *Dandi (단디)* — Korean dialect for **"tightly, properly, without a hitch."**
 
 ---
 
