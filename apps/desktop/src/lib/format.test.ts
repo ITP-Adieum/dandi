@@ -33,6 +33,7 @@ describe("format utilities", () => {
 
   it("formats archive labels, encodings, basenames, and progress percentages", () => {
     expect(formatFormatLabel("tar_zst")).toBe("TAR.ZST");
+    expect(formatFormatLabel("rar")).toBe("RAR");
     expect(shortEncodingLabel("cp949")).toBe("CP949");
     expect(shortEncodingLabel("shift_jis")).toBe("Shift_JIS");
     expect(pathBasename("/tmp/work/보고서.zip")).toBe("보고서.zip");

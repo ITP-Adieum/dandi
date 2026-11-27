@@ -64,6 +64,18 @@ export interface Dictionary {
   passwordOptional: string;
   passwordPlaceholder: string;
   aesWindowsWarning: string;
+  archiveFormat: string;
+  formatZip: string;
+  formatZipHint: string;
+  format7z: string;
+  format7zHint: string;
+  splitVolumes: string;
+  splitNone: string;
+  splitCustom: string;
+  splitCustomPlaceholder: string;
+  splitHintZip: string;
+  splitHint7z: string;
+  splitInvalid: string;
   startPack: string;
   cancel: string;
   cancelling: string;
@@ -79,6 +91,7 @@ export interface Dictionary {
   progressTitleFix: string;
   revealInFileManager: string;
   packSuccess: (entries: number, size: string) => string;
+  packSuccessVolumes: (entries: number, size: string, volumes: number) => string;
   unpackSuccess: (files: number, dir: string) => string;
   unpackSuccessWithWarnings: (files: number, dir: string, warningCount: number) => string;
   fixSuccess: (entries: number, path: string) => string;
@@ -147,12 +160,12 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     extractSelected: (n) => `Extract Selected (${n})`,
     entriesLabel: (n) => `${n.toLocaleString()} entries`,
     encryptedBadge: "Encrypted",
-    packTitle: "Create Cross-OS ZIP",
+    packTitle: "Create Cross-OS Archive",
     packInputs: "Files & Folders",
     addFiles: "Add Files",
     addFolder: "Add Folder",
     remove: "Remove",
-    outputPath: "Output ZIP",
+    outputPath: "Output Archive",
     browse: "Browse…",
     compressionLevel: "Compression",
     levelFast: "Fast (1)",
@@ -164,7 +177,20 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     passwordPlaceholder: "Leave empty for unencrypted ZIP",
     aesWindowsWarning:
       "Windows Explorer cannot open AES-256 encrypted ZIPs natively. Recipients on Windows should open it with Dandi or 7-Zip.",
-    startPack: "Create ZIP",
+    archiveFormat: "Format",
+    formatZip: "ZIP (Max Compatibility)",
+    formatZipHint: "Opens everywhere, including Windows Explorer and macOS Archive Utility.",
+    format7z: "7z (High Compression + AES-256)",
+    format7zHint:
+      "Smaller files; with a password the file names are encrypted too. Recipients need Dandi, 7-Zip, Bandizip or Keka.",
+    splitVolumes: "Split into volumes",
+    splitNone: "None",
+    splitCustom: "Custom (MB)",
+    splitCustomPlaceholder: "e.g. 50",
+    splitHintZip: "Creates name.z01, name.z02, …, name.zip. Keep every part in one folder and open the .zip.",
+    splitHint7z: "Creates name.7z.001, .002, … Keep every part in one folder and open the .001.",
+    splitInvalid: "Enter a size in MB greater than 0.",
+    startPack: "Create Archive",
     cancel: "Cancel",
     cancelling: "Cancelling…",
     close: "Close",
@@ -175,11 +201,13 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     passwordSubmit: "Unlock",
     progressEntries: (done, total) =>
       total > 0 ? `${done.toLocaleString()} / ${total.toLocaleString()} entries` : `${done.toLocaleString()} entries`,
-    progressTitlePack: "Creating ZIP…",
+    progressTitlePack: "Creating Archive…",
     progressTitleUnpack: "Extracting Archive…",
     progressTitleFix: "Repairing to Clean NFC ZIP…",
     revealInFileManager: "Reveal",
-    packSuccess: (entries, size) => `Created ZIP with ${entries.toLocaleString()} entries (${size}).`,
+    packSuccess: (entries, size) => `Created archive with ${entries.toLocaleString()} entries (${size}).`,
+    packSuccessVolumes: (entries, size, volumes) =>
+      `Created ${volumes} volumes with ${entries.toLocaleString()} entries (${size}).`,
     unpackSuccess: (files, dir) => `Extracted ${files.toLocaleString()} files to ${dir}.`,
     unpackSuccessWithWarnings: (files, dir, warningCount) =>
       `Extracted ${files.toLocaleString()} files to ${dir} with ${warningCount} warning(s).`,
@@ -274,7 +302,7 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     extractSelected: (n) => `선택 항목 풀기 (${n})`,
     entriesLabel: (n) => `${n.toLocaleString()}개 항목`,
     encryptedBadge: "암호화됨",
-    packTitle: "크로스 OS ZIP 만들기",
+    packTitle: "크로스 OS 압축 파일 만들기",
     packInputs: "포함할 파일 및 폴더",
     addFiles: "파일 추가",
     addFolder: "폴더 추가",
@@ -291,7 +319,20 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     passwordPlaceholder: "비워두면 암호 없이 압축합니다",
     aesWindowsWarning:
       "Windows 기본 탐색기는 AES-256 암호화 ZIP을 열 수 없습니다. Windows에서는 단디(Dandi) 또는 7-Zip으로 열어주세요.",
-    startPack: "ZIP 생성",
+    archiveFormat: "형식",
+    formatZip: "ZIP (최대 호환성)",
+    formatZipHint: "Windows 탐색기, macOS 아카이브 유틸리티 등 어디서나 열립니다.",
+    format7z: "7z (고압축 + AES-256)",
+    format7zHint:
+      "더 작게 압축합니다. 암호를 걸면 파일 이름까지 암호화됩니다. 받는 사람은 단디, 7-Zip, 반디집, Keka 중 하나가 필요합니다.",
+    splitVolumes: "분할 압축",
+    splitNone: "안 함",
+    splitCustom: "직접 입력 (MB)",
+    splitCustomPlaceholder: "예: 50",
+    splitHintZip: "이름.z01, 이름.z02, …, 이름.zip 으로 나뉩니다. 모든 조각을 한 폴더에 두고 .zip 을 여세요.",
+    splitHint7z: "이름.7z.001, .002, … 로 나뉩니다. 모든 조각을 한 폴더에 두고 .001 을 여세요.",
+    splitInvalid: "0보다 큰 MB 값을 입력하세요.",
+    startPack: "압축하기",
     cancel: "취소",
     cancelling: "취소 중…",
     close: "닫기",
@@ -302,11 +343,13 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     passwordSubmit: "확인",
     progressEntries: (done, total) =>
       total > 0 ? `${done.toLocaleString()} / ${total.toLocaleString()} 항목` : `${done.toLocaleString()} 항목`,
-    progressTitlePack: "ZIP 압축 중…",
+    progressTitlePack: "압축 중…",
     progressTitleUnpack: "압축 푸는 중…",
     progressTitleFix: "깨끗한 NFC ZIP으로 변환 중…",
     revealInFileManager: "폴더에서 보기",
-    packSuccess: (entries, size) => `${entries.toLocaleString()}개 항목을 ZIP(${size})으로 압축했습니다.`,
+    packSuccess: (entries, size) => `${entries.toLocaleString()}개 항목을 압축했습니다 (${size}).`,
+    packSuccessVolumes: (entries, size, volumes) =>
+      `${entries.toLocaleString()}개 항목을 ${volumes}개 조각으로 압축했습니다 (${size}).`,
     unpackSuccess: (files, dir) => `${files.toLocaleString()}개 파일을 ${dir}에 풀었습니다.`,
     unpackSuccessWithWarnings: (files, dir, warningCount) =>
       `${files.toLocaleString()}개 파일을 ${dir}에 풀었습니다 (경고 ${warningCount}건).`,
@@ -401,12 +444,12 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     extractSelected: (n) => `選択項目を展開 (${n})`,
     entriesLabel: (n) => `${n.toLocaleString()}件`,
     encryptedBadge: "暗号化",
-    packTitle: "クロスOS ZIPを作成",
+    packTitle: "クロスOS書庫を作成",
     packInputs: "対象ファイル・フォルダ",
     addFiles: "ファイル追加",
     addFolder: "フォルダ追加",
     remove: "削除",
-    outputPath: "保存先ZIP",
+    outputPath: "保存先",
     browse: "参照…",
     compressionLevel: "圧縮レベル",
     levelFast: "高速 (1)",
@@ -418,7 +461,20 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     passwordPlaceholder: "空欄の場合は暗号化しません",
     aesWindowsWarning:
       "Windows標準エクスプローラーではAES-256暗号化ZIPを開けません。Windows側ではDandiまたは7-Zipをご利用ください。",
-    startPack: "ZIPを作成",
+    archiveFormat: "形式",
+    formatZip: "ZIP（最大互換性）",
+    formatZipHint: "Windows エクスプローラーや macOS アーカイブユーティリティなど、どこでも開けます。",
+    format7z: "7z（高圧縮 + AES-256）",
+    format7zHint:
+      "より小さく圧縮します。パスワードを設定するとファイル名も暗号化されます。受信側には Dandi、7-Zip、Keka などが必要です。",
+    splitVolumes: "分割圧縮",
+    splitNone: "しない",
+    splitCustom: "カスタム (MB)",
+    splitCustomPlaceholder: "例: 50",
+    splitHintZip: "名前.z01、名前.z02、…、名前.zip に分割します。すべてのパートを同じフォルダーに置き、.zip を開いてください。",
+    splitHint7z: "名前.7z.001、.002、… に分割します。すべてのパートを同じフォルダーに置き、.001 を開いてください。",
+    splitInvalid: "0 より大きい MB 値を入力してください。",
+    startPack: "書庫を作成",
     cancel: "キャンセル",
     cancelling: "キャンセル中…",
     close: "閉じる",
@@ -429,11 +485,13 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     passwordSubmit: "解除",
     progressEntries: (done, total) =>
       total > 0 ? `${done.toLocaleString()} / ${total.toLocaleString()}件` : `${done.toLocaleString()}件`,
-    progressTitlePack: "ZIPを作成中…",
+    progressTitlePack: "書庫を作成中…",
     progressTitleUnpack: "書庫を展開中…",
     progressTitleFix: "NFC ZIPへ変換中…",
     revealInFileManager: "場所を開く",
-    packSuccess: (entries, size) => `${entries.toLocaleString()}件をZIP(${size})に圧縮しました。`,
+    packSuccess: (entries, size) => `${entries.toLocaleString()}件を圧縮しました (${size})。`,
+    packSuccessVolumes: (entries, size, volumes) =>
+      `${entries.toLocaleString()}件を${volumes}個のパートに圧縮しました (${size})。`,
     unpackSuccess: (files, dir) => `${files.toLocaleString()}件のファイルを ${dir} に展開しました。`,
     unpackSuccessWithWarnings: (files, dir, warningCount) =>
       `${files.toLocaleString()}件のファイルを ${dir} に展開しました（警告 ${warningCount}件）。`,

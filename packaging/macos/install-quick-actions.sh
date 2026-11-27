@@ -542,6 +542,7 @@ write_info_plist \
   "public.bzip2-archive" \
   "org.tukaani.xz-archive" \
   "org.7-zip.7-zip-archive" \
+  "com.rarlab.rar-archive" \
   "com.facebook.zstd-archive" \
   "public.zstd-archive"
 

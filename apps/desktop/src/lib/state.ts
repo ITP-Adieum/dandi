@@ -2,9 +2,11 @@ import type {
   ArchiveSummary,
   ErrorKind,
   ExtractMode,
+  PackFormat,
   ProgressPayload,
   UnpackWarning,
 } from "../types";
+import type { SplitPreset } from "./pack";
 
 export type ActiveOperationKind = "pack" | "unpack" | "fix";
 
@@ -47,9 +49,12 @@ export interface BannerNotice {
 export interface PackDraftState {
   inputs: string[];
   outputZip: string;
+  format: PackFormat;
   compressionLevel: number;
   excludeOsJunk: boolean;
   password: string;
+  splitPreset: SplitPreset;
+  splitCustomMb: string;
 }
 
 export interface DesktopState {

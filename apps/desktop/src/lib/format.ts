@@ -50,6 +50,8 @@ export function formatFormatLabel(fmt: ArchiveFormat): string {
       return "ZIP";
     case "seven_z":
       return "7Z";
+    case "rar":
+      return "RAR";
     case "tar":
       return "TAR";
     case "tar_gz":

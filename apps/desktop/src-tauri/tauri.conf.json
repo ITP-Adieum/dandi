@@ -57,6 +57,30 @@
         "rank": "Alternate"
       },
       {
+        "ext": ["rar"],
+        "name": "RAR Archive",
+        "description": "RAR Archive",
+        "mimeType": "application/vnd.rar",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["z01"],
+        "name": "Split ZIP Volume",
+        "description": "Split ZIP Volume",
+        "mimeType": "application/zip",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "ext": ["001"],
+        "name": "Split Archive Volume",
+        "description": "Split Archive Volume",
+        "mimeType": "application/octet-stream",
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
         "ext": ["tar"],
         "name": "TAR Archive",
         "description": "TAR Archive",

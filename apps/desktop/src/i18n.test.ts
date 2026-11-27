@@ -34,4 +34,15 @@ describe("i18n dictionaries", () => {
     expect(DICTIONARIES.ko.aesWindowsWarning).toContain("AES-256");
     expect(DICTIONARIES.ja.aesWindowsWarning).toContain("AES-256");
   });
+
+  it("labels both pack formats and the split picker in every language", () => {
+    for (const dict of Object.values(DICTIONARIES)) {
+      expect(dict.formatZip).toContain("ZIP");
+      expect(dict.format7z).toContain("7z");
+      expect(dict.format7z).toContain("AES-256");
+      expect(dict.splitHintZip).toContain(".z01");
+      expect(dict.splitHint7z).toContain(".001");
+      expect(dict.packSuccessVolumes(3, "1 MB", 4)).toContain("4");
+    }
+  });
 });

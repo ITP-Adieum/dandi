@@ -14,7 +14,7 @@ import {
   pickDestinationDirectory,
   pickPackFiles,
   pickPackFolders,
-  pickSaveZipPath,
+  pickSaveArchivePath,
   revealInFileManager,
   takePendingOpenPaths,
   toCommandError,
@@ -24,6 +24,7 @@ import { ArchiveExplorer } from "./components/ArchiveExplorer";
 import { DropZone } from "./components/DropZone";
 import { NoticeBanner } from "./components/NoticeBanner";
 import { PackModal } from "./components/PackModal";
+import { buildPackRequest, defaultPackDraft, withArchiveExtension } from "./lib/pack";
 import { PasswordModal } from "./components/PasswordModal";
 import { ProgressModal } from "./components/ProgressModal";
 import { TopBar } from "./components/TopBar";
@@ -158,16 +159,7 @@ export default function App() {
         suggestedOutput = "";
       }
     }
-    dispatch({
-      type: "open_pack_modal",
-      draft: {
-        inputs,
-        outputZip: suggestedOutput,
-        compressionLevel: 6,
-        excludeOsJunk: true,
-        password: "",
-      },
-    });
+    dispatch({ type: "open_pack_modal", draft: defaultPackDraft(inputs, suggestedOutput) });
   }, []);
 
   const handleIncomingPaths = useCallback(
@@ -420,7 +412,7 @@ export default function App() {
     } catch {
       suggested = undefined;
     }
-    const dstZip = await pickSaveZipPath(suggested, t.fixEncodingTitle);
+    const dstZip = await pickSaveArchivePath(suggested, t.fixEncodingTitle);
     if (!dstZip) return;
     await runFixEncoding(state.archivePath, dstZip);
   };
@@ -428,8 +420,10 @@ export default function App() {
   const handleStartPack = async () => {
     const draft = state.packDraft;
     if (!draft || draft.inputs.length === 0 || !draft.outputZip.trim()) return;
-
     const opId = nextOpId("pack");
+    const request = buildPackRequest(draft, opId);
+    if (!request) return;
+
     dispatch({
       type: "operation_start",
       opId,
@@ -441,20 +435,19 @@ export default function App() {
       const report = await packArchive(
         draft.inputs,
         draft.outputZip.trim(),
-        {
-          op_id: opId,
-          compression_level: draft.compressionLevel,
-          exclude_os_junk: draft.excludeOsJunk,
-          password: draft.password || undefined,
-          overwrite: true,
-        },
+        request,
         (payload) => dispatch({ type: "operation_progress", payload })
       );
+      const volumes = report.output_volumes?.length ?? 1;
+      const size = formatBytes(report.output_bytes);
       dispatch({
         type: "operation_finish",
         notice: {
           tone: "success",
-          title: t.packSuccess(report.entries_written, formatBytes(report.output_bytes)),
+          title:
+            volumes > 1
+              ? t.packSuccessVolumes(report.entries_written, size, volumes)
+              : t.packSuccess(report.entries_written, size),
           detail: report.output_path,
           revealPath: report.output_path,
         },
@@ -502,7 +495,10 @@ export default function App() {
     let nextOutput = state.packDraft.outputZip;
     if (!nextOutput) {
       try {
-        nextOutput = await defaultOutputPath(merged, "pack_zip");
+        nextOutput = withArchiveExtension(
+          await defaultOutputPath(merged, "pack_zip"),
+          state.packDraft.format
+        );
       } catch {
         // ignore
       }
@@ -520,7 +516,10 @@ export default function App() {
     let nextOutput = state.packDraft.outputZip;
     if (!nextOutput) {
       try {
-        nextOutput = await defaultOutputPath(merged, "pack_zip");
+        nextOutput = withArchiveExtension(
+          await defaultOutputPath(merged, "pack_zip"),
+          state.packDraft.format
+        );
       } catch {
         // ignore
       }
@@ -533,7 +532,11 @@ export default function App() {
 
   const handlePickPackOutput = async () => {
     if (!state.packDraft) return;
-    const picked = await pickSaveZipPath(state.packDraft.outputZip || undefined, t.packTitle);
+    const picked = await pickSaveArchivePath(
+      state.packDraft.outputZip || undefined,
+      t.packTitle,
+      state.packDraft.format
+    );
     if (picked) {
       dispatch({ type: "update_pack_draft", patch: { outputZip: picked } });
     }
