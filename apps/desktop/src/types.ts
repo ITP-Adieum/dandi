@@ -103,6 +103,12 @@ export interface CollisionRename {
   resolved: string;
 }
 
+export type UnpackWarning =
+  | { kind: "symlink_skipped"; path: string; target: string; reason: string }
+  | { kind: "permission_apply_failed"; path: string; reason: string }
+  | { kind: "mtime_apply_failed"; path: string; reason: string }
+  | { kind: "zone_id_propagate_failed"; path: string; reason: string };
+
 export interface UnpackReport {
   format: ArchiveFormat;
   output_dir: string;
@@ -111,10 +117,12 @@ export interface UnpackReport {
   files_extracted: number;
   dirs_created: number;
   symlinks_created: number;
+  symlinks_skipped?: number;
   junk_skipped: number;
   bytes_written: number;
   sanitized_paths: number;
   renamed_collisions: CollisionRename[];
+  warnings?: UnpackWarning[];
 }
 
 export interface RepackReport {
@@ -135,6 +143,7 @@ export type ErrorKind =
   | "unsafe_symlink"
   | "budget_exceeded"
   | "cancelled"
+  | "already_exists"
   | "invalid_input"
   | "unsupported_encoding"
   | "archive_engine"
