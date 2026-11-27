@@ -16,6 +16,10 @@ describe("i18n dictionaries", () => {
     const enPhaseKeys = Object.keys(DICTIONARIES.en.phases).sort();
     expect(Object.keys(DICTIONARIES.ko.phases).sort()).toEqual(enPhaseKeys);
     expect(Object.keys(DICTIONARIES.ja.phases).sort()).toEqual(enPhaseKeys);
+
+    const enWarningKindKeys = Object.keys(DICTIONARIES.en.warningKinds).sort();
+    expect(Object.keys(DICTIONARIES.ko.warningKinds).sort()).toEqual(enWarningKindKeys);
+    expect(Object.keys(DICTIONARIES.ja.warningKinds).sort()).toEqual(enWarningKindKeys);
   });
 
   it("detects locale from BCP-47 language tags", () => {
