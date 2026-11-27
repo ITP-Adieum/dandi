@@ -119,20 +119,31 @@ pub fn read_unix_mode_for_pack(metadata: &std::fs::Metadata, is_symlink: bool) -
     }
 }
 
+/// Result of attempting to materialize a relative symlink on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymlinkOutcome {
+    /// Symlink was created on disk.
+    Created,
+    /// Skipped on Windows because the process lacks `SeCreateSymbolicLinkPrivilege`
+    /// (`ERROR_PRIVILEGE_NOT_HELD`, error code 1314).
+    SkippedPrivilegeNotHeld,
+}
+
 /// Creates a relative symlink at `link_path` pointing to `target`.
+///
+/// Fails with `io::ErrorKind::AlreadyExists` if `link_path` already exists; callers enforcing
+/// overwrite policy must explicitly remove existing entries only when `overwrite` is enabled.
 pub fn create_relative_symlink(
     link_path: &Path,
     target: &str,
     target_is_dir: bool,
-) -> io::Result<()> {
+) -> io::Result<SymlinkOutcome> {
     let fs_link = to_fs_path(link_path);
-    if fs_link.symlink_metadata().is_ok() {
-        let _ = std::fs::remove_file(&fs_link);
-    }
     #[cfg(unix)]
     {
         let _ = target_is_dir;
-        std::os::unix::fs::symlink(target, &fs_link)
+        std::os::unix::fs::symlink(target, &fs_link)?;
+        Ok(SymlinkOutcome::Created)
     }
     #[cfg(windows)]
     {
@@ -143,9 +154,11 @@ pub fn create_relative_symlink(
             std::os::windows::fs::symlink_file(&win_target, &fs_link)
         };
         match res {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(SymlinkOutcome::Created),
             // ERROR_PRIVILEGE_NOT_HELD (1314) when Developer Mode is disabled on Windows
-            Err(err) if err.raw_os_error() == Some(1314) => Ok(()),
+            Err(err) if err.raw_os_error() == Some(1314) => {
+                Ok(SymlinkOutcome::SkippedPrivilegeNotHeld)
+            }
             Err(err) => Err(err),
         }
     }

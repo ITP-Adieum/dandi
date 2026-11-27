@@ -1,7 +1,6 @@
-use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufReader, Read};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bzip2::read::BzDecoder;
@@ -9,21 +8,16 @@ use flate2::read::GzDecoder;
 use lzma_rust2::XzReader;
 use tar::{Archive, EntryType};
 
+use crate::archive::extract_sink::ExtractionSink;
 use crate::archive::{
-    check_not_through_archive_symlink, check_symlink_chain_safe, ensure_no_symlink_ancestors,
     plan_extract_root, synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary,
-    DirCleanupGuard, EntryKind, InspectOptions, UnpackOptions, UnpackReport,
+    EntryKind, InspectOptions, UnpackOptions, UnpackReport,
 };
 use crate::codec::{decode_entry_name_with_override, detect_archive_encoding, EntryEncodingFlags};
 use crate::error::{DandiError, Result};
-use crate::platform::{
-    apply_unix_mode, create_relative_symlink, read_zone_identifier, set_mtime, to_fs_path,
-    write_zone_identifier,
-};
+use crate::platform::{read_zone_identifier, to_fs_path};
 use crate::progress::{CancellationToken, ProgressEvent, ProgressObserver, ProgressPhase};
-use crate::safety::{
-    is_os_junk, sanitize_entry_path, validate_symlink_target, CollisionTracker, SafetyBudget,
-};
+use crate::safety::{is_os_junk, sanitize_entry_path, SafetyBudget};
 
 const STREAM_BUF_SIZE: usize = 256 * 1024;
 
@@ -320,13 +314,7 @@ pub(crate) fn unpack_tar(
     let mut visible_for_smart: Vec<(String, EntryKind)> = Vec::new();
     let mut junk_skipped = 0usize;
     let mut total_bytes_planned = 0u64;
-
-    struct PlannedTarEntry {
-        sanitized_norm: String,
-        kind: EntryKind,
-        symlink_target: Option<String>,
-    }
-    let mut planned_entries: Vec<PlannedTarEntry> = Vec::with_capacity(meta_items.len());
+    let mut declared_symlinks: Vec<(String, String)> = Vec::new();
 
     for m in &meta_items {
         opts.cancel.check()?;
@@ -348,12 +336,10 @@ pub(crate) fn unpack_tar(
         }
         budget.record_entry(m.size, 0)?;
         let sanitized = sanitize_entry_path(&decoded.path, opts.path_policy)?;
-        visible_for_smart.push((sanitized.normalized.clone(), m.kind));
-        planned_entries.push(PlannedTarEntry {
-            sanitized_norm: sanitized.normalized,
-            kind: m.kind,
-            symlink_target: m.symlink_target.clone(),
-        });
+        visible_for_smart.push((sanitized.normalized().to_string(), m.kind));
+        if m.kind == EntryKind::Symlink {
+            declared_symlinks.push((decoded.path, m.symlink_target.clone().unwrap_or_default()));
+        }
         total_bytes_planned = total_bytes_planned.saturating_add(m.size);
     }
 
@@ -365,50 +351,15 @@ pub(crate) fn unpack_tar(
         &visible_for_smart,
     )?;
 
-    // Populate symlink_paths_lower AFTER plan_extract_root using stripped effective paths
-    // (matching zip_io.rs) and validate all symlinks against escape and multi-hop chaining.
-    let mut symlink_paths_lower: HashSet<String> = HashSet::new();
-    let mut prevalidated_symlinks: Vec<(PathBuf, String)> = Vec::new();
-    for pe in &planned_entries {
-        if pe.kind != EntryKind::Symlink {
-            continue;
-        }
-        let eff_str = strip_prefix(&pe.sanitized_norm, plan.strip_prefix.as_deref());
-        if eff_str.is_empty() {
-            continue;
-        }
-        let eff = sanitize_entry_path(&eff_str, opts.path_policy)?;
-        let target = pe.symlink_target.as_deref().unwrap_or_default();
-        validate_symlink_target(&plan.extract_root, &eff.relative, target)?;
-        symlink_paths_lower.insert(eff.normalized.to_lowercase());
-        prevalidated_symlinks.push((eff.relative, target.to_string()));
+    let mut sink = ExtractionSink::new(plan, opts, budget, zone_data)?;
+    for (decoded_path, target) in &declared_symlinks {
+        sink.register_declared_symlink(decoded_path, target)?;
     }
-    for (link_rel, target) in &prevalidated_symlinks {
-        check_symlink_chain_safe(link_rel, target, &symlink_paths_lower)?;
-    }
-
-    fs::create_dir_all(to_fs_path(&plan.extract_root))
-        .map_err(|e| DandiError::io(&plan.extract_root, e))?;
-    let mut dir_guard = DirCleanupGuard::new(plan.cleanup_root.clone());
+    sink.validate_declared_symlink_chains()?;
 
     let (reader, error_slot, _) =
         open_tar_reader(archive_path, fmt, &opts.budget, opts.cancel.clone())?;
     let mut tar_archive = Archive::new(reader);
-
-    let mut collisions = CollisionTracker::new();
-    let mut sanitized_paths = 0usize;
-    let mut files_extracted = 0usize;
-    let mut dirs_created = 0usize;
-    let mut symlinks_created = 0usize;
-
-    struct PendingSymlink {
-        link_rel: PathBuf,
-        target: String,
-        mtime: Option<i64>,
-    }
-    let mut pending_symlinks: Vec<PendingSymlink> = Vec::new();
-    let mut deferred_dir_mtimes: Vec<(PathBuf, i64, Option<u32>)> = Vec::new();
-    let mut read_buf = vec![0u8; STREAM_BUF_SIZE];
 
     for (idx, entry_res) in tar_archive
         .entries()
@@ -443,156 +394,42 @@ pub(crate) fn unpack_tar(
             continue;
         }
 
-        let sanitized = sanitize_entry_path(&decoded.path, opts.path_policy)?;
-        if sanitized.was_sanitized {
-            sanitized_paths += 1;
-        }
-        let eff_str = strip_prefix(&sanitized.normalized, plan.strip_prefix.as_deref());
-        if eff_str.is_empty() {
-            continue;
-        }
-        let eff = sanitize_entry_path(&eff_str, opts.path_policy)?;
         let mtime = entry.header().mtime().ok().map(|v| v as i64);
         let unix_mode = entry.header().mode().ok();
 
-        match kind {
-            EntryKind::Directory => {
-                check_not_through_archive_symlink(&eff.normalized, &symlink_paths_lower)?;
-                collisions.register_dir(&eff.normalized);
-                let out_path = plan.extract_root.join(&eff.relative);
-                ensure_no_symlink_ancestors(&plan.extract_root, &eff.relative)?;
-                fs::create_dir_all(to_fs_path(&out_path))
-                    .map_err(|e| DandiError::io(&out_path, e))?;
-                dirs_created += 1;
-                if let Some(ts) = mtime {
-                    deferred_dir_mtimes.push((out_path, ts, unix_mode));
-                } else if let Some(mode) = unix_mode {
-                    let _ = apply_unix_mode(&out_path, mode, true);
-                }
-            }
+        let extracted_norm = match kind {
+            EntryKind::Directory => sink.extract_directory(&decoded.path, mtime, unix_mode)?,
             EntryKind::Symlink => {
                 let target = entry
                     .link_name_bytes()
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_default();
-                let resolved_rel = collisions.resolve_file(&eff);
-                validate_symlink_target(&plan.extract_root, &resolved_rel, &target)?;
-                check_symlink_chain_safe(&resolved_rel, &target, &symlink_paths_lower)?;
-                pending_symlinks.push(PendingSymlink {
-                    link_rel: resolved_rel,
-                    target,
-                    mtime,
-                });
+                sink.queue_symlink(&decoded.path, target, mtime)?
             }
-            EntryKind::File => {
-                check_not_through_archive_symlink(&eff.normalized, &symlink_paths_lower)?;
-                let resolved_rel = collisions.resolve_file(&eff);
-                let out_path = plan.extract_root.join(&resolved_rel);
-                if let Some(parent_rel) = resolved_rel.parent() {
-                    if !parent_rel.as_os_str().is_empty() {
-                        ensure_no_symlink_ancestors(&plan.extract_root, parent_rel)?;
-                        let parent_abs = plan.extract_root.join(parent_rel);
-                        fs::create_dir_all(to_fs_path(&parent_abs))
-                            .map_err(|e| DandiError::io(&parent_abs, e))?;
-                    }
-                }
-                ensure_no_symlink_ancestors(&plan.extract_root, &resolved_rel)?;
+            EntryKind::File => sink.extract_file(
+                &decoded.path,
+                &mut entry,
+                archive_file_size,
+                false,
+                mtime,
+                unix_mode,
+                |e| take_stream_or_corrupt(&error_slot, e),
+            )?,
+        };
 
-                let fs_out = to_fs_path(&out_path);
-                let out_file = File::create(&fs_out).map_err(|e| DandiError::io(&out_path, e))?;
-                let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, out_file);
-                let mut entry_written = 0u64;
-
-                loop {
-                    opts.cancel.check()?;
-                    let n = entry
-                        .read(&mut read_buf)
-                        .map_err(|e| take_stream_or_corrupt(&error_slot, e))?;
-                    if n == 0 {
-                        break;
-                    }
-                    entry_written = entry_written.saturating_add(n as u64);
-                    budget.record_written_bytes(n as u64, entry_written, archive_file_size)?;
-                    writer.write_all(&read_buf[..n])?;
-                }
-                writer.flush()?;
-                drop(writer);
-
-                if let Some(mode) = unix_mode {
-                    let _ = apply_unix_mode(&out_path, mode, false);
-                }
-                if let Some(ts) = mtime {
-                    let _ = set_mtime(&out_path, ts, false);
-                }
-                if let Some(ref zdata) = zone_data {
-                    let _ = write_zone_identifier(&out_path, zdata);
-                }
-                files_extracted += 1;
-            }
-        }
-
-        observer.on_progress(&ProgressEvent {
-            phase: ProgressPhase::Unpacking,
-            current_entry: eff.normalized,
-            entries_done: idx + 1,
-            entries_total: meta_items.len(),
-            bytes_done: budget.bytes_written(),
-            bytes_total: total_bytes_planned.max(1),
-        });
-    }
-
-    for sym in pending_symlinks {
-        opts.cancel.check()?;
-        check_symlink_chain_safe(&sym.link_rel, &sym.target, &symlink_paths_lower)?;
-        ensure_no_symlink_ancestors(&plan.extract_root, &sym.link_rel)?;
-        let abs_link = plan.extract_root.join(&sym.link_rel);
-        if let Some(parent) = abs_link.parent() {
-            fs::create_dir_all(to_fs_path(parent)).map_err(|e| DandiError::io(parent, e))?;
-        }
-        let target_resolved =
-            validate_symlink_target(&plan.extract_root, &sym.link_rel, &sym.target)?;
-        let target_is_dir = to_fs_path(&target_resolved).is_dir();
-        create_relative_symlink(&abs_link, &sym.target, target_is_dir)
-            .map_err(|e| DandiError::io(&abs_link, e))?;
-        if let Some(ts) = sym.mtime {
-            let _ = set_mtime(&abs_link, ts, true);
-        }
-        symlinks_created += 1;
-    }
-
-    for (dir_path, ts, mode) in deferred_dir_mtimes.into_iter().rev() {
-        let _ = set_mtime(&dir_path, ts, false);
-        if let Some(m) = mode {
-            let _ = apply_unix_mode(&dir_path, m, true);
+        if let Some(current_entry) = extracted_norm {
+            observer.on_progress(&ProgressEvent {
+                phase: ProgressPhase::Unpacking,
+                current_entry,
+                entries_done: idx + 1,
+                entries_total: meta_items.len(),
+                bytes_done: sink.bytes_written(),
+                bytes_total: total_bytes_planned.max(1),
+            });
         }
     }
 
-    dir_guard.disarm();
-
-    Ok(UnpackReport {
-        format: fmt,
-        output_dir: plan.reported_output_dir,
-        detected_encoding: detection.encoding,
-        applied_encoding,
-        files_extracted,
-        dirs_created,
-        symlinks_created,
-        junk_skipped,
-        bytes_written: budget.bytes_written(),
-        sanitized_paths,
-        renamed_collisions: collisions.into_renames(),
-    })
-}
-
-fn strip_prefix(normalized: &str, prefix: Option<&str>) -> String {
-    match prefix {
-        Some(p) if normalized == p => String::new(),
-        Some(p) => normalized
-            .strip_prefix(&format!("{p}/"))
-            .unwrap_or(normalized)
-            .to_string(),
-        None => normalized.to_string(),
-    }
+    sink.finish(fmt, detection.encoding, applied_encoding, junk_skipped)
 }
 
 #[cfg(test)]

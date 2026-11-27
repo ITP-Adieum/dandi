@@ -49,15 +49,30 @@ fn cli_pack_inspect_list_unpack_fix_roundtrip() {
 
     let dest = tmp.path().join("extracted");
     let unpack_out = Command::new(bin)
-        .args(["unpack", "--mode", "smart", "-d"])
+        .args(["unpack", "--json", "--mode", "smart", "-d"])
         .arg(&dest)
         .arg(&zip_path)
         .output()
         .unwrap();
     assert!(unpack_out.status.success());
+    let unpack_json: serde_json::Value = serde_json::from_slice(&unpack_out.stdout).unwrap();
+    assert_eq!(unpack_json["symlinks_skipped"].as_u64(), Some(0));
+    assert_eq!(unpack_json["warnings"].as_array().map(Vec::len), Some(0));
     assert_eq!(
         fs::read(dest.join("sample_proj/가나다_문서.txt")).unwrap(),
         b"hello dandi cli"
+    );
+
+    // Direct mode without --overwrite MUST fail when file already exists
+    let clash_out = Command::new(bin)
+        .args(["unpack", "--mode", "direct", "-d"])
+        .arg(&dest)
+        .arg(&zip_path)
+        .output()
+        .unwrap();
+    assert!(
+        !clash_out.status.success(),
+        "direct unpack without --overwrite should fail on existing files"
     );
 
     let fixed_zip = tmp.path().join("fixed.zip");

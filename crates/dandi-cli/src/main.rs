@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use dandi_core::{
     inspect, pack, repack_nfc, unpack, DandiError, EncodingId, EntryKind, ExtractMode,
-    InspectOptions, NoopProgressObserver, PackOptions, RepackOptions, UnpackOptions,
+    InspectOptions, NoopProgressObserver, PackOptions, RepackOptions, UnpackOptions, UnpackWarning,
 };
 
 #[derive(Parser)]
@@ -239,14 +239,47 @@ fn run(cli: Cli) -> Result<(), DandiError> {
             if cli.json {
                 print_json(&report)?;
             } else {
+                let mut extras = Vec::new();
+                if report.symlinks_skipped > 0 {
+                    extras.push(format!("{} symlinks skipped", report.symlinks_skipped));
+                }
+                if !report.warnings.is_empty() {
+                    extras.push(format!("{} warning(s)", report.warnings.len()));
+                }
+                let extra_suffix = if extras.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", extras.join(", "))
+                };
                 println!(
-                    "Unpacked {} files, {} dirs, {} symlinks (encoding: {}) -> {}",
+                    "Unpacked {} files, {} dirs, {} symlinks{} (encoding: {}) -> {}",
                     report.files_extracted,
                     report.dirs_created,
                     report.symlinks_created,
+                    extra_suffix,
                     report.applied_encoding.canonical_name(),
                     report.output_dir.display()
                 );
+                for w in &report.warnings {
+                    match w {
+                        UnpackWarning::SymlinkSkipped {
+                            path,
+                            target,
+                            reason,
+                        } => eprintln!("warning: skipped symlink '{path}' -> '{target}': {reason}"),
+                        UnpackWarning::PermissionApplyFailed { path, reason } => {
+                            eprintln!("warning: failed to apply permissions on '{path}': {reason}")
+                        }
+                        UnpackWarning::MtimeApplyFailed { path, reason } => {
+                            eprintln!("warning: failed to set mtime on '{path}': {reason}")
+                        }
+                        UnpackWarning::ZoneIdPropagateFailed { path, reason } => {
+                            eprintln!(
+                                "warning: failed to propagate Zone.Identifier on '{path}': {reason}"
+                            )
+                        }
+                    }
+                }
             }
         }
         Commands::List {

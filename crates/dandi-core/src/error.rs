@@ -43,6 +43,9 @@ pub enum DandiError {
     #[error("operation cancelled")]
     Cancelled,
 
+    #[error("destination already exists: '{}'", path.display())]
+    AlreadyExists { path: PathBuf },
+
     #[error("invalid input: {0}")]
     InvalidInput(String),
 

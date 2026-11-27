@@ -1,7 +1,8 @@
+pub(crate) mod extract_sink;
 pub mod format;
 pub mod sevenz;
 pub mod tar_io;
-pub mod zip_io;
+pub mod zip;
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -9,13 +10,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{EncodingDetection, EncodingId};
-use crate::error::{DandiError, Result};
+use crate::error::Result;
 use crate::platform::to_fs_path;
 use crate::progress::{CancellationToken, ProgressObserver};
 use crate::safety::{is_os_junk, CollisionRename, PathPolicy, SafetyBudget};
 
 pub use format::{detect_format, ArchiveFormat};
-pub use zip_io::{inspect_zip_raw_headers, RawZipEntryHeader};
+pub use zip::{inspect_zip_raw_headers, parse_zip_raw_headers_from_bytes, RawZipEntryHeader};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +149,29 @@ impl Default for UnpackOptions {
     }
 }
 
+/// Non-fatal warning recorded during extraction instead of silently discarding OS errors.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UnpackWarning {
+    SymlinkSkipped {
+        path: String,
+        target: String,
+        reason: String,
+    },
+    PermissionApplyFailed {
+        path: String,
+        reason: String,
+    },
+    MtimeApplyFailed {
+        path: String,
+        reason: String,
+    },
+    ZoneIdPropagateFailed {
+        path: String,
+        reason: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnpackReport {
     pub format: ArchiveFormat,
@@ -157,10 +181,12 @@ pub struct UnpackReport {
     pub files_extracted: usize,
     pub dirs_created: usize,
     pub symlinks_created: usize,
+    pub symlinks_skipped: usize,
     pub junk_skipped: usize,
     pub bytes_written: u64,
     pub sanitized_paths: usize,
     pub renamed_collisions: Vec<CollisionRename>,
+    pub warnings: Vec<UnpackWarning>,
 }
 
 #[derive(Clone, Debug)]
@@ -203,7 +229,7 @@ pub struct RepackReport {
 pub fn inspect(archive_path: &Path, opts: &InspectOptions) -> Result<ArchiveSummary> {
     let fmt = detect_format(archive_path)?;
     match fmt {
-        ArchiveFormat::Zip => zip_io::inspect_zip(archive_path, opts),
+        ArchiveFormat::Zip => zip::inspect_zip(archive_path, opts),
         ArchiveFormat::SevenZ => sevenz::inspect_7z(archive_path, opts),
         ArchiveFormat::Tar
         | ArchiveFormat::TarGz
@@ -220,7 +246,7 @@ pub fn pack(
     opts: &PackOptions,
     observer: &dyn ProgressObserver,
 ) -> Result<PackReport> {
-    zip_io::pack_zip(inputs, output_zip, opts, observer)
+    zip::pack_zip(inputs, output_zip, opts, observer)
 }
 
 /// Unpacks any supported archive (ZIP, 7z, TAR.*) with safety guards and smart extraction.
@@ -232,7 +258,7 @@ pub fn unpack(
 ) -> Result<UnpackReport> {
     let fmt = detect_format(archive_path)?;
     match fmt {
-        ArchiveFormat::Zip => zip_io::unpack_zip(archive_path, dest_dir, opts, observer),
+        ArchiveFormat::Zip => zip::unpack_zip(archive_path, dest_dir, opts, observer),
         ArchiveFormat::SevenZ => sevenz::unpack_7z(archive_path, dest_dir, opts, observer),
         ArchiveFormat::Tar
         | ArchiveFormat::TarGz
@@ -249,7 +275,7 @@ pub fn repack_nfc(
     opts: &RepackOptions,
     observer: &dyn ProgressObserver,
 ) -> Result<RepackReport> {
-    zip_io::repack_zip_nfc(src_zip, dst_zip, opts, observer)
+    zip::repack_zip_nfc(src_zip, dst_zip, opts, observer)
 }
 
 /// Synthesizes missing parent directory entries (`MacPacker#47`) for tree inspection.
@@ -437,112 +463,5 @@ fn resolve_unique_dir(parent: &Path, base_name: &str, overwrite: bool) -> PathBu
             return candidate;
         }
         counter += 1;
-    }
-}
-
-/// Ensures no existing ancestor between `root` and `target` is a symlink on disk.
-pub(crate) fn ensure_no_symlink_ancestors(root: &Path, rel: &Path) -> Result<()> {
-    let mut current = root.to_path_buf();
-    for comp in rel.components() {
-        current.push(comp);
-        let fs_cur = to_fs_path(&current);
-        if let Ok(meta) = std::fs::symlink_metadata(&fs_cur) {
-            if meta.file_type().is_symlink() {
-                return Err(DandiError::UnsafeSymlink {
-                    path: rel.to_string_lossy().into_owned(),
-                    target: current.display().to_string(),
-                    reason: "refusing to traverse or overwrite existing symlink during extraction"
-                        .to_string(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Checks if any prefix of `normalized` matches a symlink declared in the archive.
-pub(crate) fn check_not_through_archive_symlink(
-    normalized: &str,
-    symlink_paths_lower: &HashSet<String>,
-) -> Result<()> {
-    let mut prefix = String::new();
-    let parts: Vec<&str> = normalized.split('/').collect();
-    for (idx, part) in parts.iter().enumerate() {
-        if idx > 0 {
-            prefix.push('/');
-        }
-        prefix.push_str(&part.to_lowercase());
-        if symlink_paths_lower.contains(&prefix) {
-            return Err(DandiError::UnsafeSymlink {
-                path: normalized.to_string(),
-                target: prefix,
-                reason: "entry attempts to write through a symlink path in the archive".to_string(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Checks that a symlink's own strict ancestor paths AND its lexically traversed target path
-/// do not pass through any archive-declared symlink (blocks multi-hop symlink chaining).
-pub(crate) fn check_symlink_chain_safe(
-    link_rel: &Path,
-    target: &str,
-    symlink_paths_lower: &HashSet<String>,
-) -> Result<()> {
-    let link_norm = link_rel.to_string_lossy().replace('\\', "/");
-    let parts: Vec<&str> = link_norm.split('/').collect();
-    if parts.len() > 1 {
-        let mut prefix = String::new();
-        for (idx, part) in parts[..parts.len() - 1].iter().enumerate() {
-            if idx > 0 {
-                prefix.push('/');
-            }
-            prefix.push_str(&part.to_lowercase());
-            if symlink_paths_lower.contains(&prefix) {
-                return Err(DandiError::UnsafeSymlink {
-                    path: link_norm,
-                    target: target.to_string(),
-                    reason: format!(
-                        "symlink ancestor '{prefix}' is itself a symlink in the archive"
-                    ),
-                });
-            }
-        }
-    }
-
-    let (_resolved, traversed_lower) = crate::safety::resolve_symlink_steps(link_rel, target)?;
-    for step in traversed_lower {
-        if symlink_paths_lower.contains(&step) {
-            return Err(DandiError::UnsafeSymlink {
-                path: link_norm,
-                target: target.to_string(),
-                reason: format!("symlink target traverses another symlink '{step}' in the archive"),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// RAII cleanup guard for an extraction directory created fresh by Dandi.
-pub(crate) struct DirCleanupGuard {
-    path: Option<PathBuf>,
-}
-
-impl DirCleanupGuard {
-    pub fn new(path: Option<PathBuf>) -> Self {
-        Self { path }
-    }
-
-    pub fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for DirCleanupGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.path.take() {
-            let _ = std::fs::remove_dir_all(to_fs_path(&p));
-        }
     }
 }
