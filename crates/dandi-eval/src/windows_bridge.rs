@@ -82,7 +82,7 @@ pub fn verify_zip_on_windows(
     windows_ssh: Option<&str>,
 ) -> Result<WinExtractVerification, String> {
     let tag = rand_tag();
-    let (remote_dir_ps, zip_path_ps) = if let Some(host) = windows_ssh {
+    let (remote_dir_ps, _zip_path_ps) = if let Some(host) = windows_ssh {
         // Resolve remote %TEMP% path cleanly first.
         let remote_temp =
             run_powershell(Some(host), "[System.IO.Path]::GetTempPath().TrimEnd('\\')")?;
@@ -125,8 +125,8 @@ pub fn verify_zip_on_windows(
     let ps_script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
-$workDir = '{remote_dir_ps}'
-$zipPath = '{zip_path_ps}'
+$workDir = (Get-Item -LiteralPath '{remote_dir_ps}').FullName
+$zipPath = Join-Path $workDir 'payload.zip'
 $expDir  = Join-Path $workDir 'explorer'
 $psDir   = Join-Path $workDir 'expand_archive'
 $expectedCount = {expected_file_count}
@@ -135,8 +135,18 @@ try {{
     New-Item -ItemType Directory -Path $expDir -Force | Out-Null
     New-Item -ItemType Directory -Path $psDir -Force | Out-Null
 
-    # 1. PowerShell Expand-Archive
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $psDir -Force
+    # 1. PowerShell Expand-Archive (with .NET ZipFile fallback for GitHub Runner PSModulePath 5.1/7 conflict)
+    try {{
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $psDir -Force
+    }} catch {{
+        if ($_.Exception.Message -like '*ExtractToDirectory*') {{
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            Remove-Item -LiteralPath $psDir -Recurse -Force -ErrorAction SilentlyContinue
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $psDir)
+        }} else {{
+            throw
+        }}
+    }}
 
     # 2. Real Windows Explorer COM (Shell.Application)
     $shell = New-Object -ComObject Shell.Application
@@ -159,13 +169,14 @@ try {{
     }}
 
     function Scan-Tree([string]$root) {{
+        $rootFull = (Get-Item -LiteralPath $root).FullName.TrimEnd('\')
         $files = @{{}}
         $junk = 0
         $sha = [System.Security.Cryptography.SHA256]::Create()
         try {{
-            $items = Get-ChildItem -LiteralPath $root -Recurse -File -Force
+            $items = Get-ChildItem -LiteralPath $rootFull -Recurse -File -Force
             foreach ($it in $items) {{
-                $rel = $it.FullName.Substring($root.Length).TrimStart('\').Replace('\', '/')
+                $rel = $it.FullName.Substring($rootFull.Length).TrimStart('\').Replace('\', '/')
                 $name = $it.Name
                 if ($rel -match '(^|/)__MACOSX(/|$)' -or $name -eq '.DS_Store' -or $name.StartsWith('._') -or $name -ieq 'Thumbs.db' -or $name -ieq 'desktop.ini') {{
                     $junk++
@@ -261,10 +272,11 @@ $cp949 = [System.Text.Encoding]::GetEncoding(949)
 [System.IO.Compression.ZipFile]::CreateFromDirectory($srcDir, $cpZip, [System.IO.Compression.CompressionLevel]::Optimal, $false, $cp949)
 
 $sha = [System.Security.Cryptography.SHA256]::Create()
+$srcFull = (Get-Item -LiteralPath $srcDir).FullName.TrimEnd('\')
 $map = @{{}}
 try {{
-    foreach ($it in (Get-ChildItem -LiteralPath $srcDir -Recurse -File)) {{
-        $rel = $it.FullName.Substring($srcDir.Length).TrimStart('\').Replace('\', '/')
+    foreach ($it in (Get-ChildItem -LiteralPath $srcFull -Recurse -File)) {{
+        $rel = $it.FullName.Substring($srcFull.Length).TrimStart('\').Replace('\', '/')
         $bytes = [System.IO.File]::ReadAllBytes($it.FullName)
         $hashHex = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
         $map[$rel] = $hashHex
