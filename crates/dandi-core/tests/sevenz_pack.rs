@@ -61,6 +61,8 @@ fn make_tree(root: &Path) -> PathBuf {
     fs::write(docs.join("empty.txt"), b"").unwrap();
     fs::write(docs.join(".DS_Store"), b"junk").unwrap();
     fs::write(docs.join("._photo.jpg"), b"appledouble").unwrap();
+    // Windows file names cannot contain control characters.
+    #[cfg(unix)]
     fs::write(docs.join("Icon\r"), b"icon").unwrap();
     docs
 }
@@ -102,7 +104,7 @@ fn pack_7z_writes_nfc_names_and_skips_os_junk() {
     let out = tmp.path().join("docs.7z");
     let report = pack_7z(&docs, &out, None, None);
     assert_eq!(report.output_volumes, vec![out.clone()]);
-    assert_eq!(report.junk_skipped, 3);
+    assert_eq!(report.junk_skipped, if cfg!(unix) { 3 } else { 2 });
     assert!(!report.encrypted);
 
     // Read back with sevenz-rust2 directly rather than through Dandi's reader.
