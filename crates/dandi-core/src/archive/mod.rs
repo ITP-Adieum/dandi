@@ -463,7 +463,18 @@ pub(crate) fn plan_extract_root(
     }
 }
 
+/// Folder name used by `Wrap`/`Smart` extraction; never empty or dots-only (`...part1.rar`
+/// would otherwise yield `..` and escape `dest_dir`).
 pub(crate) fn archive_stem(archive_path: &Path) -> String {
+    let stem = raw_archive_stem(archive_path);
+    if stem.trim_matches('.').trim().is_empty() {
+        "extracted".to_string()
+    } else {
+        stem
+    }
+}
+
+fn raw_archive_stem(archive_path: &Path) -> String {
     let mut file_name = archive_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -514,5 +525,25 @@ fn resolve_unique_dir(parent: &Path, base_name: &str, overwrite: bool) -> PathBu
             return candidate;
         }
         counter += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_stem_strips_split_and_multi_suffixes() {
+        assert_eq!(archive_stem(Path::new("/x/photos.part01.rar")), "photos");
+        assert_eq!(archive_stem(Path::new("/x/backup.zip.001")), "backup");
+        assert_eq!(archive_stem(Path::new("/x/logs.tar.gz.002")), "logs");
+        assert_eq!(archive_stem(Path::new("/x/set.z01")), "set");
+    }
+
+    #[test]
+    fn archive_stem_never_yields_a_parent_reference() {
+        for name in ["...part1.rar", "...tar.gz", "..rar", "...zip.001"] {
+            assert_eq!(archive_stem(Path::new(name)), "extracted", "{name}");
+        }
     }
 }

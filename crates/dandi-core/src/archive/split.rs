@@ -12,6 +12,8 @@ use crate::platform::to_fs_path;
 /// Minimum allowed split volume size (64 KiB).
 pub const MIN_SPLIT_SIZE_BYTES: u64 = 64 * 1024;
 
+const MAX_SPLIT_VOLUMES: u32 = 100_000;
+
 /// PKWARE APPNOTE split ZIP leading signature on Disk 0 (`.z01`).
 pub(crate) const PKWARE_SPLIT_SIG: u32 = 0x0807_4b50;
 
@@ -90,9 +92,12 @@ pub(crate) fn discover_volumes(path: &Path) -> Result<VolumeSet> {
         .unwrap_or_else(|| Path::new("."));
 
     // 1. Check numeric split suffix (`.001`, `.002`, ..., `.0001`).
-    if let Some((base_name, width, _clicked_part)) = parse_numeric_split_name(&file_name) {
-        if looks_like_archive_base(&base_name) || part1_has_archive_magic(parent, &base_name, width)
-        {
+    if let Some((base_name, width, clicked_part)) = parse_numeric_split_name(&file_name) {
+        let part1 = parent.join(format!("{base_name}.{:0width$}", 1));
+        // A complete archive merely named like a later part (`report.zip.2024`) opens on its own.
+        let standalone =
+            clicked_part != 1 && !to_fs_path(&part1).exists() && has_archive_magic(path);
+        if !standalone && (looks_like_archive_base(&base_name) || has_archive_magic(&part1)) {
             return discover_numeric_volumes(parent, &base_name, width);
         }
     }
@@ -145,9 +150,8 @@ fn looks_like_archive_base(base_name: &str) -> bool {
     .any(|ext| lower.ends_with(ext))
 }
 
-fn part1_has_archive_magic(parent: &Path, base_name: &str, width: usize) -> bool {
-    let part1 = parent.join(format!("{base_name}.{:0width$}", 1));
-    let Ok(mut f) = File::open(to_fs_path(&part1)) else {
+fn has_archive_magic(path: &Path) -> bool {
+    let Ok(mut f) = File::open(to_fs_path(path)) else {
         return false;
     };
     let mut header = [0u8; 512];
@@ -166,7 +170,7 @@ fn discover_numeric_volumes(parent: &Path, base_name: &str, width: usize) -> Res
         let entry = entry_res.map_err(|e| DandiError::io(parent, e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(suffix) = name.strip_prefix(&prefix) {
-            if suffix.len() >= 3 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            if suffix.len() == width && suffix.bytes().all(|b| b.is_ascii_digit()) {
                 if let Ok(num) = suffix.parse::<usize>() {
                     if num >= 1 {
                         found.push((num, parent.join(name)));
@@ -300,7 +304,6 @@ fn discover_pkware_from_final_zip(
         }
     }
 
-    const MAX_SPLIT_VOLUMES: u32 = 100_000;
     if info.number_of_this_disk > MAX_SPLIT_VOLUMES {
         return Err(DandiError::CorruptArchive(format!(
             "split ZIP declares {} disks, exceeding safety cap {MAX_SPLIT_VOLUMES}",
@@ -596,81 +599,48 @@ fn rename_volume(src: &Path, dst: &Path) -> Result<()> {
     fs::rename(&fs_src, &fs_dst).map_err(|e| DandiError::io(dst, e))
 }
 
-/// Volumes of an older set at the same output name that discovery would otherwise splice into
-/// the new set (e.g. a leftover `.004` after re-packing into three volumes).
-fn stale_sibling_volumes(
-    final_paths: &[PathBuf],
-    is_sibling: impl Fn(&str) -> bool,
-) -> Result<Vec<PathBuf>> {
-    let Some(first) = final_paths.first() else {
-        return Ok(Vec::new());
-    };
-    let parent = first
+/// Leftover volumes of an older set at the same name: the run of consecutively numbered
+/// volumes right after the new set's last one (`.004`, `.005` after re-packing into three).
+/// Unrelated siblings such as `backup.zip.2024` or a lone `backup.z99` are never touched.
+fn stale_volumes_after(first_stale: u32, name_of: impl Fn(u32) -> Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut stale = Vec::new();
+    for idx in first_stale..MAX_SPLIT_VOLUMES {
+        let existing: Vec<PathBuf> = name_of(idx)
+            .into_iter()
+            .filter(|p| to_fs_path(p).is_file())
+            .collect();
+        if existing.is_empty() {
+            break;
+        }
+        stale.extend(existing);
+    }
+    stale
+}
+
+fn numeric_volume_name(output_base: &Path, idx: u32, width: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{idx:0width$}", output_base.to_string_lossy()))
+}
+
+fn pkware_volume_names(output_zip: &Path, idx: u32) -> Vec<PathBuf> {
+    let parent = output_zip
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let entries = match fs::read_dir(to_fs_path(parent)) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(DandiError::io(parent, e)),
-    };
-    let mut stale = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| DandiError::io(parent, e))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_sibling(&name) {
-            continue;
-        }
-        let path = parent.join(&name);
-        if !final_paths
-            .iter()
-            .any(|p| p.file_name() == path.file_name())
-        {
-            stale.push(path);
-        }
-    }
-    stale.sort();
-    Ok(stale)
-}
-
-fn numeric_sibling_matcher(output_base: &Path) -> impl Fn(&str) -> bool {
-    let prefix = format!(
-        "{}.",
-        output_base
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    );
-    move |name: &str| {
-        name.strip_prefix(&prefix)
-            .is_some_and(|suffix| suffix.len() >= 3 && suffix.bytes().all(|b| b.is_ascii_digit()))
-    }
-}
-
-fn pkware_sibling_matcher(output_zip: &Path) -> impl Fn(&str) -> bool {
     let (stem, _) = pkware_stem(output_zip);
-    let prefix = format!("{stem}.");
-    move |name: &str| {
-        name.strip_prefix(&prefix)
-            .and_then(|ext| parse_pkware_z_part(&format!("x.{ext}")))
-            .is_some()
-    }
+    let lower = parent.join(pkware_part_filename(&stem, idx, false));
+    let upper = parent.join(pkware_part_filename(&stem, idx, true));
+    vec![lower, upper]
 }
 
-/// Fails fast with `AlreadyExists` when `overwrite` is off and the output name or any sibling
-/// volume of it already exists, before any compression work starts.
+/// Fails fast with `AlreadyExists` when `overwrite` is off and the output name or the first
+/// volume it would create already exists, before any compression work starts.
 pub(crate) fn ensure_split_destination_free(output: &Path, style: SplitStyle) -> Result<()> {
-    if to_fs_path(output).exists() {
-        return Err(DandiError::AlreadyExists {
-            path: output.to_path_buf(),
-        });
+    let mut taken = vec![output.to_path_buf()];
+    match style {
+        SplitStyle::Numeric => taken.push(numeric_volume_name(output, 1, 3)),
+        SplitStyle::PkwareZip => taken.extend(pkware_volume_names(output, 1)),
     }
-    let probe = [output.to_path_buf()];
-    let existing = match style {
-        SplitStyle::Numeric => stale_sibling_volumes(&probe, numeric_sibling_matcher(output))?,
-        SplitStyle::PkwareZip => stale_sibling_volumes(&probe, pkware_sibling_matcher(output))?,
-    };
-    match existing.into_iter().next() {
+    match taken.into_iter().find(|p| to_fs_path(p).exists()) {
         Some(path) => Err(DandiError::AlreadyExists { path }),
         None => Ok(()),
     }
@@ -840,11 +810,12 @@ impl SplitVolumeWriter {
 
         let count = self.temp_paths.len().max(1);
         let width = count.to_string().len().max(3);
-        let base_str = output_base.to_string_lossy();
-        let final_paths: Vec<PathBuf> = (1..=self.temp_paths.len())
-            .map(|i| PathBuf::from(format!("{base_str}.{i:0width$}")))
+        let final_paths: Vec<PathBuf> = (1..=count as u32)
+            .map(|i| numeric_volume_name(output_base, i, width))
             .collect();
-        let stale = stale_sibling_volumes(&final_paths, numeric_sibling_matcher(output_base))?;
+        let stale = stale_volumes_after(count as u32 + 1, |i| {
+            vec![numeric_volume_name(output_base, i, width)]
+        });
 
         let mut staged = std::mem::take(&mut self.temp_paths);
         if let Err(err) = commit_staged_volumes(&mut staged, &final_paths, &stale, overwrite) {
@@ -1136,6 +1107,8 @@ impl PkwareSplitWriter {
                 .unwrap_or_else(|| ".dandi-pkware".to_string())
         );
         let new_path = self.parent.join(new_name);
+        // Tracked before it exists so `Drop` also removes it if the copy fails.
+        self.temp_paths.push(new_path.clone());
 
         let mut src =
             File::open(to_fs_path(&old_path)).map_err(|e| DandiError::io(&old_path, e))?;
@@ -1143,16 +1116,15 @@ impl PkwareSplitWriter {
         let mut dst = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(to_fs_path(&new_path))
             .map_err(|e| DandiError::io(&new_path, e))?;
 
-        let copied = io::copy(&mut src, &mut dst)?;
+        let copied = io::copy(&mut src, &mut dst).map_err(|e| DandiError::io(&new_path, e))?;
         drop(src);
         let _ = fs::remove_file(to_fs_path(&old_path));
 
-        self.temp_paths[0] = new_path;
+        self.temp_paths.remove(0);
         self.disk_lengths[0] = copied;
         self.disk_offset = copied;
         self.total_bytes = copied;
@@ -1173,7 +1145,8 @@ impl PkwareSplitWriter {
 
         let num_disks = self.temp_paths.len();
         let final_paths = pkware_final_volume_paths(output_zip, num_disks);
-        let stale = stale_sibling_volumes(&final_paths, pkware_sibling_matcher(output_zip))?;
+        let first_stale = u32::try_from(num_disks).unwrap_or(MAX_SPLIT_VOLUMES);
+        let stale = stale_volumes_after(first_stale, |i| pkware_volume_names(output_zip, i));
 
         let mut staged = std::mem::take(&mut self.temp_paths);
         if let Err(err) = commit_staged_volumes(&mut staged, &final_paths, &stale, overwrite) {

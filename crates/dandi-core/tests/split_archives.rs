@@ -581,3 +581,35 @@ fn info_zip_merges_pkware_split_set() {
         String::from_utf8_lossy(&test.stdout)
     );
 }
+
+/// Only the consecutive run after the new set is "an older set"; look-alike names are user files.
+#[test]
+fn unrelated_numbered_siblings_survive_and_standalone_numbered_zip_opens() {
+    let tmp = TempDir::new().unwrap();
+    let bundle = make_tree(&tmp.path().join("src"), 200);
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let yearly = out_dir.join("out.zip.2024");
+    pack(
+        &[bundle.join("readme.txt")],
+        &yearly,
+        &PackOptions::default(),
+        &NoopProgressObserver,
+    )
+    .unwrap();
+    let lone_z99 = out_dir.join("out.z99");
+    fs::write(&lone_z99, b"not part of any set").unwrap();
+
+    for style in [SplitStyle::Numeric, SplitStyle::PkwareZip] {
+        let report = pack_split(&bundle, &out_dir.join("out.zip"), style, SPLIT, None);
+        assert!(report.output_volumes.len() > 1);
+        assert!(yearly.exists(), "{style:?} deleted out.zip.2024");
+        assert!(lone_z99.exists(), "{style:?} deleted out.z99");
+        let dest = tmp.path().join(format!("x_{style:?}"));
+        unpack_direct(&report.output_volumes[0], &dest, None);
+        assert_eq!(hash_tree(&dest.join("bundle")), hash_tree(&bundle));
+    }
+
+    assert_eq!(listed_paths(&yearly), vec!["readme.txt"]);
+}

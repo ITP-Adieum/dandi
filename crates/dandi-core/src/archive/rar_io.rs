@@ -124,15 +124,19 @@ fn resolve_native_rar_first_volume(path: &Path) -> Result<PathBuf> {
                     let width = digits.len();
                     let part_tag = &stem_without_rar[pos..pos + 5];
                     let base = &stem_without_rar[..pos];
-                    let first_path =
-                        parent.join(format!("{base}{part_tag}{:0width$}{ext_case}", 1));
-                    if !to_fs_path(&first_path).is_file() {
-                        return Err(DandiError::CorruptArchive(format!(
-                            "missing RAR volume '{}'",
-                            first_path.display()
-                        )));
-                    }
-                    return Ok(first_path);
+                    // Sets may be zero-padded (`part01`) or not (`part1` ... `part10`).
+                    let padded = parent.join(format!("{base}{part_tag}{:0width$}{ext_case}", 1));
+                    let unpadded = parent.join(format!("{base}{part_tag}1{ext_case}"));
+                    return [&padded, &unpadded]
+                        .into_iter()
+                        .find(|p| to_fs_path(p).is_file())
+                        .cloned()
+                        .ok_or_else(|| {
+                            DandiError::CorruptArchive(format!(
+                                "missing RAR volume '{}'",
+                                padded.display()
+                            ))
+                        });
                 }
             }
         }
@@ -921,5 +925,31 @@ fn map_rar_error(err: &RarError, first_volume: Option<&Path>) -> DandiError {
         RarErrorKind::InvalidArgument => DandiError::InvalidInput(err.to_string()),
         RarErrorKind::Io => DandiError::CorruptArchive(err.to_string()),
         _ => DandiError::CorruptArchive(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn later_part_resolves_to_padded_or_unpadded_first_volume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for name in [
+            "plain.part1.rar",
+            "plain.part10.rar",
+            "pad.part01.rar",
+            "pad.part02.rar",
+        ] {
+            fs::write(tmp.path().join(name), b"").unwrap();
+        }
+        let first = resolve_native_rar_first_volume(&tmp.path().join("plain.part10.rar")).unwrap();
+        assert_eq!(first, tmp.path().join("plain.part1.rar"));
+        let first = resolve_native_rar_first_volume(&tmp.path().join("pad.part02.rar")).unwrap();
+        assert_eq!(first, tmp.path().join("pad.part01.rar"));
+        assert!(matches!(
+            resolve_native_rar_first_volume(&tmp.path().join("gone.part3.rar")),
+            Err(DandiError::CorruptArchive(_))
+        ));
     }
 }

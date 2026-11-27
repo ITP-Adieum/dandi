@@ -305,8 +305,9 @@ fn rar4_and_rar5_inspect_and_unpack_through_the_sink() {
         } else {
             // RAR4 stores DOS local time without a zone (as WinRAR does), so the result shifts by
             // the packer's and the reader's UTC offsets; only a whole-quarter-hour shift is valid.
+            let off_quarter = drift.rem_euclid(900).min(900 - drift.rem_euclid(900));
             assert!(
-                drift.abs() <= 28 * 3600 && drift.rem_euclid(900) <= 2,
+                drift.abs() <= 28 * 3600 && off_quarter <= 2,
                 "{fixture}: mtime {modified}"
             );
         }
