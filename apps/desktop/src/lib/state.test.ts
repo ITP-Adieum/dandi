@@ -228,4 +228,45 @@ describe("desktopReducer state transitions", () => {
     expect(s.activeOp).toBeNull();
     expect(s.notice?.title).toBe("Cancelled");
   });
+
+  it("defaults overwriteExisting to false (including in direct mode) and toggles cleanly", () => {
+    expect(INITIAL_DESKTOP_STATE.overwriteExisting).toBe(false);
+
+    let s = desktopReducer(INITIAL_DESKTOP_STATE, {
+      type: "set_extract_mode",
+      mode: "direct",
+    });
+    expect(s.extractMode).toBe("direct");
+    expect(s.overwriteExisting).toBe(false);
+
+    s = desktopReducer(s, { type: "set_overwrite_existing", value: true });
+    expect(s.overwriteExisting).toBe(true);
+
+    s = desktopReducer(s, { type: "set_overwrite_existing", value: false });
+    expect(s.overwriteExisting).toBe(false);
+  });
+
+  it("retains structured warnings on completion notice until dismissed", () => {
+    const s = desktopReducer(INITIAL_DESKTOP_STATE, {
+      type: "operation_finish",
+      notice: {
+        tone: "warning",
+        title: "Extracted 3 files to /tmp/out with 1 warning(s).",
+        detail: "1 symlink(s) skipped.",
+        revealPath: "/tmp/out",
+        warnings: [
+          {
+            kind: "symlink_skipped",
+            label: "Symlink skipped",
+            path: "bin/tool",
+            target: "../lib/tool",
+            reason: "Windows symlink privilege not available",
+          },
+        ],
+      },
+    });
+    expect(s.notice?.tone).toBe("warning");
+    expect(s.notice?.warnings).toHaveLength(1);
+    expect(s.notice?.warnings?.[0]?.path).toBe("bin/tool");
+  });
 });

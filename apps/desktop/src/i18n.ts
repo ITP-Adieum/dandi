@@ -1,4 +1,4 @@
-import type { Locale, ProgressPhase, ErrorKind } from "./types";
+import type { Locale, ProgressPhase, ErrorKind, UnpackWarning } from "./types";
 
 export interface Dictionary {
   appName: string;
@@ -42,6 +42,8 @@ export interface Dictionary {
   modeDirectHint: string;
   modeWrapHint: string;
   openAfterExtract: string;
+  overwriteExisting: string;
+  overwriteExistingHint: string;
   extractAll: string;
   extractSelected: (count: number) => string;
   entriesLabel: (count: number) => string;
@@ -78,13 +80,19 @@ export interface Dictionary {
   revealInFileManager: string;
   packSuccess: (entries: number, size: string) => string;
   unpackSuccess: (files: number, dir: string) => string;
+  unpackSuccessWithWarnings: (files: number, dir: string, warningCount: number) => string;
   fixSuccess: (entries: number, path: string) => string;
   collisionsRenamed: (count: number) => string;
+  symlinksSkippedSummary: (count: number) => string;
+  warningsShow: (count: number) => string;
+  warningsHide: string;
+  alreadyExistsGuidance: string;
   inspectingArchive: string;
   themeSystem: string;
   themeLight: string;
   themeDark: string;
   phases: Record<ProgressPhase, string>;
+  warningKinds: Record<UnpackWarning["kind"], string>;
   errors: Record<ErrorKind, string>;
 }
 
@@ -132,6 +140,9 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     modeDirectHint: "Extract everything directly into the chosen destination folder.",
     modeWrapHint: "Always create a subfolder named after the archive.",
     openAfterExtract: "Open folder after extraction",
+    overwriteExisting: "Overwrite existing files",
+    overwriteExistingHint:
+      "Replace existing files at the destination instead of stopping on conflict.",
     extractAll: "Extract All",
     extractSelected: (n) => `Extract Selected (${n})`,
     entriesLabel: (n) => `${n.toLocaleString()} entries`,
@@ -170,8 +181,15 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     revealInFileManager: "Reveal",
     packSuccess: (entries, size) => `Created ZIP with ${entries.toLocaleString()} entries (${size}).`,
     unpackSuccess: (files, dir) => `Extracted ${files.toLocaleString()} files to ${dir}.`,
+    unpackSuccessWithWarnings: (files, dir, warningCount) =>
+      `Extracted ${files.toLocaleString()} files to ${dir} with ${warningCount} warning(s).`,
     fixSuccess: (entries, path) => `Saved clean NFC ZIP (${entries.toLocaleString()} entries) to ${path}.`,
     collisionsRenamed: (n) => `${n} case-insensitive filename collision(s) safely disambiguated.`,
+    symlinksSkippedSummary: (n) => `${n} symlink(s) skipped.`,
+    warningsShow: (n) => `Show warnings (${n})`,
+    warningsHide: "Hide warnings",
+    alreadyExistsGuidance:
+      "Enable \"Overwrite existing files\" below or pick Smart/Wrap layout to avoid overwriting existing files.",
     inspectingArchive: "Inspecting archive…",
     themeSystem: "System",
     themeLight: "Light",
@@ -182,6 +200,12 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
       unpacking: "Extracting",
       repacking: "Repacking NFC",
       finalizing: "Finalizing",
+    },
+    warningKinds: {
+      symlink_skipped: "Symlink skipped",
+      permission_apply_failed: "Permissions not applied",
+      mtime_apply_failed: "Timestamp not applied",
+      zone_id_propagate_failed: "Zone.Identifier not applied",
     },
     errors: {
       io: "File I/O error",
@@ -243,6 +267,9 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     modeDirectHint: "선택한 위치에 폴더를 만들지 않고 바로 풉니다.",
     modeWrapHint: "항상 압축 파일 이름의 새 폴더 안에 풉니다.",
     openAfterExtract: "완료 후 폴더 열기",
+    overwriteExisting: "기존 파일 덮어쓰기",
+    overwriteExistingHint:
+      "대상 위치에 같은 이름의 파일이 있으면 중단하지 않고 덮어씁니다.",
     extractAll: "전체 풀기",
     extractSelected: (n) => `선택 항목 풀기 (${n})`,
     entriesLabel: (n) => `${n.toLocaleString()}개 항목`,
@@ -281,8 +308,15 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     revealInFileManager: "폴더에서 보기",
     packSuccess: (entries, size) => `${entries.toLocaleString()}개 항목을 ZIP(${size})으로 압축했습니다.`,
     unpackSuccess: (files, dir) => `${files.toLocaleString()}개 파일을 ${dir}에 풀었습니다.`,
+    unpackSuccessWithWarnings: (files, dir, warningCount) =>
+      `${files.toLocaleString()}개 파일을 ${dir}에 풀었습니다 (경고 ${warningCount}건).`,
     fixSuccess: (entries, path) => `깨끗한 NFC ZIP(${entries.toLocaleString()}개 항목)을 ${path}에 저장했습니다.`,
     collisionsRenamed: (n) => `대소문자 충돌 파일 ${n}건을 안전하게 이름 변경했습니다.`,
+    symlinksSkippedSummary: (n) => `심볼릭 링크 ${n}건을 건너뛰었습니다.`,
+    warningsShow: (n) => `경고 보기 (${n})`,
+    warningsHide: "경고 접기",
+    alreadyExistsGuidance:
+      "기존 파일을 덮어쓰려면 하단의 '기존 파일 덮어쓰기'를 켜거나 스마트/폴더 생성 방식을 선택하세요.",
     inspectingArchive: "압축 파일 분석 중…",
     themeSystem: "시스템",
     themeLight: "라이트",
@@ -293,6 +327,12 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
       unpacking: "해제 중",
       repacking: "NFC 재압축 중",
       finalizing: "마무리 중",
+    },
+    warningKinds: {
+      symlink_skipped: "심볼릭 링크 건너뜀",
+      permission_apply_failed: "권한 적용 실패",
+      mtime_apply_failed: "수정 시간 적용 실패",
+      zone_id_propagate_failed: "Zone.Identifier 전파 실패",
     },
     errors: {
       io: "파일 입출력 오류",
@@ -354,6 +394,9 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     modeDirectHint: "選択先フォルダへ直接展開します。",
     modeWrapHint: "常に書庫名のサブフォルダを作成して展開します。",
     openAfterExtract: "展開後にフォルダを開く",
+    overwriteExisting: "既存ファイルを上書き",
+    overwriteExistingHint:
+      "展開先に同名ファイルが存在する場合、停止せずに上書きします。",
     extractAll: "すべて展開",
     extractSelected: (n) => `選択項目を展開 (${n})`,
     entriesLabel: (n) => `${n.toLocaleString()}件`,
@@ -392,8 +435,15 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
     revealInFileManager: "場所を開く",
     packSuccess: (entries, size) => `${entries.toLocaleString()}件をZIP(${size})に圧縮しました。`,
     unpackSuccess: (files, dir) => `${files.toLocaleString()}件のファイルを ${dir} に展開しました。`,
+    unpackSuccessWithWarnings: (files, dir, warningCount) =>
+      `${files.toLocaleString()}件のファイルを ${dir} に展開しました（警告 ${warningCount}件）。`,
     fixSuccess: (entries, path) => `クリーンなNFC ZIP(${entries.toLocaleString()}件)を ${path} に保存しました。`,
     collisionsRenamed: (n) => `大文字・小文字の衝突ファイル ${n}件を安全にリネームしました。`,
+    symlinksSkippedSummary: (n) => `シンボリックリンク ${n}件をスキップしました。`,
+    warningsShow: (n) => `警告を表示 (${n})`,
+    warningsHide: "警告を閉じる",
+    alreadyExistsGuidance:
+      "上書きするには下部の「既存ファイルを上書き」を有効にするか、スマート／フォルダ作成モードを選択してください。",
     inspectingArchive: "書庫を解析中…",
     themeSystem: "システム",
     themeLight: "ライト",
@@ -404,6 +454,12 @@ export const DICTIONARIES: Record<Locale, Dictionary> = {
       unpacking: "展開中",
       repacking: "NFC変換中",
       finalizing: "仕上げ中",
+    },
+    warningKinds: {
+      symlink_skipped: "シンボリックリンクをスキップ",
+      permission_apply_failed: "権限の適用に失敗",
+      mtime_apply_failed: "更新日時の適用に失敗",
+      zone_id_propagate_failed: "Zone.Identifier の引き継ぎに失敗",
     },
     errors: {
       io: "ファイルI/Oエラー",

@@ -1,0 +1,325 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and draft (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Release Gate (Fmt, Clippy, Tests, Frontend)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: resolve-tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "error: invalid release tag '$TAG' (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          TAURI_VERSION="$(python3 -c 'import json; print(json.load(open("apps/desktop/src-tauri/tauri.conf.json"))["version"])')"
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" || "$TAG_VERSION" != "$TAURI_VERSION" ]]; then
+            echo "error: release tag '$TAG' (${TAG_VERSION}) does not match Cargo.toml (${CARGO_VERSION}) and tauri.conf.json (${TAURI_VERSION})" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $TAG (matches Cargo.toml & tauri.conf.json version ${TAG_VERSION})"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - name: Check Rust formatting
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+
+      - name: Workspace Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace Tests
+        run: cargo test --workspace
+
+      - name: Frontend Install, Typecheck, Vitest & Build
+        run: |
+          pnpm --dir apps/desktop install --frozen-lockfile
+          pnpm --dir apps/desktop exec tsc --noEmit
+          pnpm --dir apps/desktop test
+          pnpm --dir apps/desktop build
+
+  build:
+    name: Build Release (${{ matrix.target_name }})
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target_name: macos-arm64
+            build_desktop: true
+          - os: windows-latest
+            target_name: windows-x64
+            build_desktop: true
+          - os: ubuntu-latest
+            target_name: linux-x64
+            build_desktop: false
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
+
+      - name: Setup pnpm & Node (Desktop targets)
+        if: matrix.build_desktop
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js (Desktop targets)
+        if: matrix.build_desktop
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - name: Build CLI binary
+        run: cargo build --release -p dandi-cli
+
+      - name: Package macOS CLI & Tauri Desktop (.dmg, .app)
+        if: matrix.target_name == 'macos-arm64'
+        shell: bash
+        env:
+          RAW_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          RAW_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          RAW_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          RAW_APPLE_ID: ${{ secrets.APPLE_ID }}
+          RAW_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          RAW_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-assets
+          tar -czf "dist-assets/dandi-${RELEASE_TAG}-macos-arm64.tar.gz" -C target/release dandi
+
+          pnpm --dir apps/desktop install --frozen-lockfile
+          pnpm --dir apps/desktop build
+          cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+          # Export Apple signing/notarization variables only when configured;
+          # otherwise gracefully produce unsigned macOS bundles.
+          if [[ -n "${RAW_APPLE_CERTIFICATE}" ]]; then
+            export APPLE_CERTIFICATE="${RAW_APPLE_CERTIFICATE}"
+            export APPLE_CERTIFICATE_PASSWORD="${RAW_APPLE_CERTIFICATE_PASSWORD}"
+            export APPLE_SIGNING_IDENTITY="${RAW_APPLE_SIGNING_IDENTITY}"
+            if [[ -n "${RAW_APPLE_ID}" && -n "${RAW_APPLE_PASSWORD}" && -n "${RAW_APPLE_TEAM_ID}" ]]; then
+              export APPLE_ID="${RAW_APPLE_ID}"
+              export APPLE_PASSWORD="${RAW_APPLE_PASSWORD}"
+              export APPLE_TEAM_ID="${RAW_APPLE_TEAM_ID}"
+            fi
+            echo "Apple signing credentials detected: building signed macOS bundle."
+          else
+            echo "Apple signing secrets not configured: building unsigned macOS bundle."
+          fi
+
+          pnpm --dir apps/desktop tauri build --bundles app,dmg
+
+          dmg_file="$(find apps/desktop/src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -n 1)"
+          if [[ -z "$dmg_file" ]]; then
+            echo "error: expected .dmg bundle not found" >&2
+            exit 1
+          fi
+          cp "$dmg_file" "dist-assets/Dandi-${RELEASE_TAG}-macos-arm64.dmg"
+
+          app_dir="$(find apps/desktop/src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
+          if [[ -z "$app_dir" ]]; then
+            echo "error: expected .app bundle not found" >&2
+            exit 1
+          fi
+          tar -czf "dist-assets/Dandi-${RELEASE_TAG}-macos-arm64.app.tar.gz" \
+            -C "$(dirname "$app_dir")" "$(basename "$app_dir")"
+
+          ls -lh dist-assets
+
+      - name: Package Windows CLI & Tauri Desktop (.msi, .exe)
+        if: matrix.target_name == 'windows-x64'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force -Path dist-assets | Out-Null
+
+          pnpm --dir apps/desktop install --frozen-lockfile
+          pnpm --dir apps/desktop build
+          cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+          pnpm --dir apps/desktop tauri build --bundles msi,nsis
+
+          $msiFile = Get-ChildItem -Path "apps/desktop/src-tauri/target/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
+          $exeFile = Get-ChildItem -Path "apps/desktop/src-tauri/target/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
+          if (-not $msiFile) { throw "Expected .msi installer not found" }
+          if (-not $exeFile) { throw "Expected NSIS .exe installer not found" }
+
+          $outMsi = "dist-assets/Dandi-$env:RELEASE_TAG-windows-x64.msi"
+          $outExe = "dist-assets/Dandi-$env:RELEASE_TAG-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $msiFile.FullName -Destination $outMsi -Force
+          Copy-Item -LiteralPath $exeFile.FullName -Destination $outExe -Force
+
+          # Optional Windows Authenticode signing when certificate secrets are configured.
+          if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            $pfxPath = Join-Path $env:RUNNER_TEMP "dandi-codesign.pfx"
+            try {
+              [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+              $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+              if (-not $signtool) { throw "signtool.exe not found in Windows SDK" }
+              foreach ($bin in @("target/release/dandi.exe", $outMsi, $outExe)) {
+                & $signtool.FullName sign /f $pfxPath /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $bin
+                if ($LASTEXITCODE -ne 0) { throw "signtool failed for $bin" }
+              }
+              Write-Output "Signed Windows CLI and desktop installers."
+            }
+            finally {
+              if (Test-Path -LiteralPath $pfxPath) {
+                Remove-Item -LiteralPath $pfxPath -Force
+              }
+            }
+          } else {
+            Write-Output "Windows signing secrets not configured: building unsigned Windows installers."
+          }
+
+          Compress-Archive -Path "target/release/dandi.exe" -DestinationPath "dist-assets/dandi-$env:RELEASE_TAG-windows-x64.zip" -Force
+          Get-ChildItem dist-assets
+
+      - name: Package Linux CLI (.tar.gz)
+        if: matrix.target_name == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-assets
+          tar -czf "dist-assets/dandi-${RELEASE_TAG}-linux-x64.tar.gz" -C target/release dandi
+          ls -lh dist-assets
+
+      - name: Upload Build Assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target_name }}
+          path: dist-assets/*
+          if-no-files-found: error
+
+  release:
+    name: Checksums & Draft GitHub Release
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release-assets
+            rm -f SHA256SUMS.txt
+            mapfile -t files < <(LC_ALL=C ls -1 | sort)
+            sha256sum "${files[@]}" > SHA256SUMS.txt
+          )
+
+          cat > release-notes.md <<EOF
+          ## Dandi ${RELEASE_TAG}
+
+          Fast, open-source macOS, Windows, and Linux archiver that never breaks filenames (Unicode NFC + legacy CP949 / Shift_JIS / GB18030 / Big5 / Cyrillic auto-detection).
+
+          ### Downloads
+
+          | Platform | Desktop App | CLI Binary |
+          |---|---|---|
+          | macOS (Apple Silicon) | \`Dandi-${RELEASE_TAG}-macos-arm64.dmg\` / \`.app.tar.gz\` | \`dandi-${RELEASE_TAG}-macos-arm64.tar.gz\` |
+          | Windows (x64) | \`Dandi-${RELEASE_TAG}-windows-x64.msi\` / \`-setup.exe\` | \`dandi-${RELEASE_TAG}-windows-x64.zip\` |
+          | Linux (x64) | — | \`dandi-${RELEASE_TAG}-linux-x64.tar.gz\` |
+
+          ### First-Launch Notes (Unsigned Builds)
+
+          - **macOS**: If Gatekeeper reports an unsigned build, drag \`Dandi.app\` to \`/Applications\` and run:
+            \`\`\`bash
+            xattr -dr com.apple.quarantine /Applications/Dandi.app
+            \`\`\`
+          - **Windows**: If SmartScreen prompts on an unsigned installer, click **More info** -> **Run anyway**.
+
+          ### SHA-256 Checksums
+
+          \`\`\`text
+          $(cat release-assets/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+          cat release-notes.md
+
+      - name: Create Draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.gate.outputs.tag }}
+          name: Dandi ${{ needs.gate.outputs.tag }}
+          draft: true
+          body_path: release-notes.md
+          files: release-assets/*

@@ -3,6 +3,7 @@ import type {
   ErrorKind,
   ExtractMode,
   ProgressPayload,
+  UnpackWarning,
 } from "../types";
 
 export type ActiveOperationKind = "pack" | "unpack" | "fix";
@@ -24,11 +25,23 @@ export interface PasswordPromptState {
   encodingOverride?: string | null;
 }
 
+export type BannerTone = "success" | "warning" | "error" | "info";
+
+export interface FormattedWarningItem {
+  kind: UnpackWarning["kind"];
+  label: string;
+  path: string;
+  target?: string;
+  reason: string;
+}
+
 export interface BannerNotice {
-  tone: "success" | "error" | "info";
+  tone: BannerTone;
   title: string;
   detail?: string;
+  guidance?: string;
   revealPath?: string;
+  warnings?: FormattedWarningItem[];
 }
 
 export interface PackDraftState {
@@ -50,6 +63,7 @@ export interface DesktopState {
   showOsJunk: boolean;
   extractMode: ExtractMode;
   revealAfterExtract: boolean;
+  overwriteExisting: boolean;
   activeFolder: string;
   searchQuery: string;
   selectedIndices: number[];
@@ -70,6 +84,7 @@ export const INITIAL_DESKTOP_STATE: DesktopState = {
   showOsJunk: false,
   extractMode: "smart",
   revealAfterExtract: true,
+  overwriteExisting: false,
   activeFolder: "",
   searchQuery: "",
   selectedIndices: [],
@@ -99,6 +114,7 @@ export type DesktopAction =
   | { type: "set_show_os_junk"; value: boolean }
   | { type: "set_extract_mode"; mode: ExtractMode }
   | { type: "set_reveal_after"; value: boolean }
+  | { type: "set_overwrite_existing"; value: boolean }
   | { type: "set_active_folder"; folder: string }
   | { type: "set_search_query"; query: string }
   | { type: "set_selected_indices"; indices: number[] }
@@ -187,6 +203,8 @@ export function desktopReducer(state: DesktopState, action: DesktopAction): Desk
       return { ...state, extractMode: action.mode };
     case "set_reveal_after":
       return { ...state, revealAfterExtract: action.value };
+    case "set_overwrite_existing":
+      return { ...state, overwriteExisting: action.value };
     case "set_active_folder":
       return { ...state, activeFolder: action.folder };
     case "set_search_query":

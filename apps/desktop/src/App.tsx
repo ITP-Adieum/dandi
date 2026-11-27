@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { AlertCircle, CheckCircle2, FolderOpen, Loader2, Upload, X } from "lucide-react";
+import { Loader2, Upload } from "lucide-react";
 import {
   cancelOperation,
   classifyDroppedPaths,
@@ -22,6 +22,7 @@ import {
 } from "./api";
 import { ArchiveExplorer } from "./components/ArchiveExplorer";
 import { DropZone } from "./components/DropZone";
+import { NoticeBanner } from "./components/NoticeBanner";
 import { PackModal } from "./components/PackModal";
 import { PasswordModal } from "./components/PasswordModal";
 import { ProgressModal } from "./components/ProgressModal";
@@ -33,6 +34,7 @@ import {
   INITIAL_DESKTOP_STATE,
   type BannerNotice,
 } from "./lib/state";
+import { buildErrorNotice, buildUnpackNotice } from "./lib/warnings";
 import type { EncodingOption, ErrorKind, Locale, ThemePreference } from "./types";
 
 const STORAGE_LOCALE = "dandi.locale";
@@ -109,11 +111,7 @@ export default function App() {
   }, []);
 
   const formatErrorNotice = useCallback(
-    (kind: ErrorKind, detail: string): BannerNotice => ({
-      tone: kind === "cancelled" ? "info" : "error",
-      title: t.errors[kind] ?? detail,
-      detail: kind === "cancelled" ? undefined : detail,
-    }),
+    (kind: ErrorKind, detail: string): BannerNotice => buildErrorNotice(kind, detail, t),
     [t]
   );
 
@@ -310,7 +308,7 @@ export default function App() {
           password: pwd,
           selected_entries: selectedOnly ? stateRef.current.selectedIndices : undefined,
           exclude_os_junk: !stateRef.current.showOsJunk,
-          overwrite: false,
+          overwrite: stateRef.current.overwriteExisting,
           reveal_after: stateRef.current.revealAfterExtract,
         },
         (payload) => dispatch({ type: "operation_progress", payload })
@@ -318,18 +316,9 @@ export default function App() {
       if (passwordOverride && archivePath === stateRef.current.archivePath) {
         dispatch({ type: "set_archive_password", password: passwordOverride });
       }
-      const collisionNote =
-        report.renamed_collisions.length > 0
-          ? t.collisionsRenamed(report.renamed_collisions.length)
-          : undefined;
       dispatch({
         type: "operation_finish",
-        notice: {
-          tone: "success",
-          title: t.unpackSuccess(report.files_extracted, report.output_dir),
-          detail: collisionNote,
-          revealPath: report.output_dir,
-        },
+        notice: buildUnpackNotice(report, t),
       });
     } catch (err) {
       const cmdErr = toCommandError(err);
@@ -583,72 +572,14 @@ export default function App() {
         onCycleTheme={cycleTheme}
       />
 
-      {/* Structured notification / error banner */}
+      {/* Structured notification / warning / error banner */}
       {state.notice && (
-        <div
-          className="flex items-center justify-between gap-3 border-b px-3.5 py-2 text-xs"
-          style={{
-            backgroundColor:
-              state.notice.tone === "success"
-                ? "var(--success-bg)"
-                : state.notice.tone === "error"
-                  ? "var(--danger-bg)"
-                  : "var(--warn-bg)",
-            borderColor:
-              state.notice.tone === "success"
-                ? "var(--success-border)"
-                : state.notice.tone === "error"
-                  ? "var(--danger-border)"
-                  : "var(--warn-border)",
-            color:
-              state.notice.tone === "success"
-                ? "var(--success-text)"
-                : state.notice.tone === "error"
-                  ? "var(--danger-text)"
-                  : "var(--warn-text)",
-          }}
-        >
-          <div className="flex min-w-0 items-center gap-2">
-            {state.notice.tone === "success" ? (
-              <CheckCircle2 className="h-4 w-4 shrink-0" />
-            ) : (
-              <AlertCircle className="h-4 w-4 shrink-0" />
-            )}
-            <div className="min-w-0">
-              <div className="truncate font-medium">{state.notice.title}</div>
-              {state.notice.detail && (
-                <div className="font-mono-tabular truncate text-[11px] opacity-85">
-                  {state.notice.detail}
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="flex shrink-0 items-center gap-2">
-            {state.notice.revealPath && (
-              <button
-                type="button"
-                onClick={() => {
-                  if (state.notice?.revealPath) {
-                    handleRevealPath(state.notice.revealPath);
-                  }
-                }}
-                className="inline-flex items-center gap-1 rounded border border-current/30 px-2 py-0.5 text-[11px] font-medium hover:bg-black/5"
-              >
-                <FolderOpen className="h-3 w-3" />
-                <span>{t.revealInFileManager}</span>
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => dispatch({ type: "set_notice", notice: null })}
-              className="rounded p-0.5 hover:bg-black/10"
-              aria-label={t.close}
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        </div>
+        <NoticeBanner
+          t={t}
+          notice={state.notice}
+          onRevealPath={handleRevealPath}
+          onClose={() => dispatch({ type: "set_notice", notice: null })}
+        />
       )}
 
       {/* Main Content */}
@@ -666,6 +597,7 @@ export default function App() {
           showOsJunk={state.showOsJunk}
           extractMode={state.extractMode}
           revealAfterExtract={state.revealAfterExtract}
+          overwriteExisting={state.overwriteExisting}
           activeFolder={state.activeFolder}
           searchQuery={state.searchQuery}
           selectedIndices={state.selectedIndices}
@@ -680,6 +612,9 @@ export default function App() {
           }
           onExtractModeChange={(mode) => dispatch({ type: "set_extract_mode", mode })}
           onRevealAfterChange={(value) => dispatch({ type: "set_reveal_after", value })}
+          onOverwriteExistingChange={(value) =>
+            dispatch({ type: "set_overwrite_existing", value })
+          }
           onExtractAll={() => void handleExtractClick(false)}
           onExtractSelected={() => void handleExtractClick(true)}
         />

@@ -46,6 +46,7 @@ interface ArchiveExplorerProps {
   showOsJunk: boolean;
   extractMode: ExtractMode;
   revealAfterExtract: boolean;
+  overwriteExisting: boolean;
   activeFolder: string;
   searchQuery: string;
   selectedIndices: number[];
@@ -58,6 +59,7 @@ interface ArchiveExplorerProps {
   onSelectedIndicesChange: (indices: number[]) => void;
   onExtractModeChange: (mode: ExtractMode) => void;
   onRevealAfterChange: (value: boolean) => void;
+  onOverwriteExistingChange: (value: boolean) => void;
   onExtractAll: () => void;
   onExtractSelected: () => void;
 }
@@ -70,6 +72,7 @@ export function ArchiveExplorer({
   showOsJunk,
   extractMode,
   revealAfterExtract,
+  overwriteExisting,
   activeFolder,
   searchQuery,
   selectedIndices,
@@ -82,6 +85,7 @@ export function ArchiveExplorer({
   onSelectedIndicesChange,
   onExtractModeChange,
   onRevealAfterChange,
+  onOverwriteExistingChange,
   onExtractAll,
   onExtractSelected,
 }: ArchiveExplorerProps) {
@@ -705,6 +709,20 @@ export function ArchiveExplorer({
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
+          <label
+            className="inline-flex cursor-pointer items-center gap-1.5 text-xs"
+            style={{ color: "var(--text-secondary)" }}
+            title={t.overwriteExistingHint}
+          >
+            <input
+              type="checkbox"
+              checked={overwriteExisting}
+              onChange={(e) => onOverwriteExistingChange(e.target.checked)}
+              className="accent-[var(--accent)]"
+            />
+            <span>{t.overwriteExisting}</span>
+          </label>
+
           <label
             className="inline-flex cursor-pointer items-center gap-1.5 text-xs"
             style={{ color: "var(--text-secondary)" }}
