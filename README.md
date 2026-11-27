@@ -2,7 +2,7 @@
 
 > **Fast, open-source macOS & Windows archiver that never breaks filenames.**
 >
-> *Dandi (단디)* is a Korean dialect word meaning **"tightly, properly, without a hitch"** — and sounds just like English **"dandy"**.
+> *Dandi (단디)* — Korean dialect for **"tightly, properly, without a hitch."**
 
 ---
 
@@ -14,7 +14,7 @@ Sharing `.zip` files between macOS, Windows, and Linux still breaks filenames ev
 - **Windows → macOS**: Legacy Windows tools pack non-UTF-8 archives using local codepages (**CP949**, **Shift_JIS**, **GB18030/GBK**, **Big5**, **CP1251**, **Windows-1252**) without UTF-8 flags, causing mojibake on macOS.
 - **Hidden traps**: Broken timestamps (missing UTC `0x5455`), `000` Unix permissions on macOS, broken `.app` symlinks, Zip Slip vulnerabilities, and Windows reserved filename crashes (`CON`, `NUL`, `: * ?`, >260 chars).
 
-Dandi solves all of these **by default**, in a single lightweight cross-platform codebase (**Rust core + Tauri v2**, MIT licensed).
+Dandi solves all of these **by default**, in a single lightweight cross-platform codebase (**Rust core + Tauri v2**, GPLv3 licensed).
 
 ---
 
@@ -47,6 +47,8 @@ dandi/
 
 ---
 
-## License
+## License & Trademark
 
-MIT © [ITP-Adieum](https://github.com/ITP-Adieum)
+- **Source Code**: Licensed under the [GNU General Public License v3.0](LICENSE) (`GPL-3.0-only`) © [ITP-Adieum](https://github.com/ITP-Adieum). Free for personal and commercial/company use.
+- **Trademark**: The **Dandi** name and logo are trademarks of ITP-Adieum and are not covered by the GPL-3.0 license. Forks must use a distinct name and icon.
+- **Commercial / Dual Licensing**: Commercial redistribution or proprietary embedding licenses are available from ITP-Adieum.
