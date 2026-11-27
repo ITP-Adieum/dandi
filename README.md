@@ -41,8 +41,8 @@ dandi/
 ## Roadmap
 
 - [x] **M0 — Research & Architecture**: Cross-archiver issue archaeology ([`docs/ISSUE_AUDIT.md`](docs/ISSUE_AUDIT.md)), deep-module architecture ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)), 100-point eval rubric ([`docs/EVAL_RUBRIC.md`](docs/EVAL_RUBRIC.md)).
-- [ ] **M1 — Core Engine + CLI + Eval Harness**: Rust `dandi-core`, `dandi-cli`, `dandi-eval` passing **≥ 95/100** (with 100% Security & Cross-OS native round-trip on macOS + Windows).
-- [ ] **M2 — Tauri v2 Desktop GUI**: Drag-and-drop pack/unpack, archive tree preview, 1-click legacy encoding preview switcher, smart extraction, progress & clean cancellation.
+- [x] **M1 — Core Engine + CLI + Eval Harness**: Rust `dandi-core`, `dandi-cli`, `dandi-eval` passing **100/100** (with 100% Security & Cross-OS native round-trip on macOS + Windows).
+- [x] **M2 — Tauri v2 Desktop GUI**: Drag-and-drop pack/unpack, archive tree preview, 1-click legacy encoding preview switcher, NFC repair, smart extraction, progress & clean cancellation.
 - [ ] **M3 — OS Shell Integration & Releases**: macOS `.dmg` + Finder integration, Windows `.msi` + Explorer context menu, GitHub Actions CI & automated releases.
 
 ---
