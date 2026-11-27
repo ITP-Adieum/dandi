@@ -6,7 +6,7 @@
     Registers clean HKCU Explorer shell verbs without requiring Administrator UAC
     and without duplicating Windows 10 / Windows 11 registrations (NanaZip#328):
       - Files & folders: "Compress with Dandi (Clean ZIP)" -> dandi.exe pack
-      - Archive extensions (.zip, .7z, .tar, .tgz, .gz, .zst, .bz2, .xz, .tzst, .tbz2, .txz):
+      - Archive extensions (.zip, .7z, .rar, .z01, .001, .tar, .tgz, .gz, .zst, .bz2, .xz, .tzst, .tbz2, .txz):
           "Extract with Dandi (Smart)" -> dandi.exe unpack --mode smart
           "Open in Dandi"              -> dandi-desktop.exe
 .PARAMETER DandiBin
@@ -30,7 +30,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ArchiveExtensions = @(
-    ".zip", ".7z", ".tar", ".tgz", ".gz",
+    ".zip", ".7z", ".rar", ".z01", ".001", ".tar", ".tgz", ".gz",
     ".zst", ".bz2", ".xz", ".tzst", ".tbz2", ".txz"
 )
 

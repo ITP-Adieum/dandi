@@ -1,6 +1,7 @@
 export type ArchiveFormat =
   | "zip"
   | "seven_z"
+  | "rar"
   | "tar"
   | "tar_gz"
   | "tar_zst"
@@ -86,8 +87,13 @@ export interface ProgressPayload {
   bytes_total: number;
 }
 
+export type PackFormat = "zip" | "seven_z";
+
+export type SplitStyle = "pkware_zip" | "numeric";
+
 export interface PackReport {
   output_path: string;
+  output_volumes: string[];
   entries_written: number;
   files_deflated: number;
   files_stored: number;
@@ -163,9 +169,13 @@ export type OutputPathKind = "pack_zip" | "fix_nfc_zip" | "extract_dir";
 
 export interface PackRequestOptions {
   op_id?: string;
+  format?: PackFormat;
   compression_level?: number;
   exclude_os_junk?: boolean;
   password?: string;
+  /** Volume size such as "25M"; parsed and validated by dandi-core. */
+  split_size?: string;
+  split_style?: SplitStyle;
   overwrite?: boolean;
 }
 

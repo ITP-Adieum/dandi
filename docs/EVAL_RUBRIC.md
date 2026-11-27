@@ -46,8 +46,8 @@
 | `COMPAT-03` | 5 | **macOS `.app`-like Executable & Symlink Round-Trip**: Pack bundle with `+x` script + relative intra-bundle symlink; unpack with `dandi` on macOS | `+x` bit preserved (never `000`), relative symlink intact & valid |
 | `COMPAT-04` | 4 | **UTC Timestamp Fidelity (`0x5455`)**: Pack files with explicit mtimes; inspect raw ZIP headers + verify unpacked mtime within ≤ 2s | `0x5455` UTC extra field present; no timezone shift on unpack |
 | `COMPAT-05` | 3 | **ZIP64 & Large Entry Count**: Pack/unpack archive with >1,000 files + verify external ZIP64 fixture | Clean unpack, exact entry count & hashes, ZIP64 omitted on small archives |
-| `COMPAT-06` | 2 | **WinZip AES-256 + Unicode Password**: Pack with Korean+ASCII password (`단디-Pass!2026`); unpack with `dandi` | Exact byte recovery; wrong password returns structured `InvalidPassword` error |
-| `COMPAT-07` | 2 | **Extended Format Reading**: Unpack `.7z`, `.tar.gz`, `.tar.zst`, `.tar.bz2`, `.tar.xz` fixtures | 100% SHA-256 match across all formats |
+| `COMPAT-06` | 2 | **WinZip AES-256 + 7z AES-256 + Unicode Password**: Pack ZIP with `단디-Pass!2026` and `.7z` with `단디-7z!2026`; unpack with `dandi` using the NFD form of each password | Exact byte recovery; wrong password returns structured `InvalidPassword`; `.7z` without password returns `PasswordRequired` and leaks no file names |
+| `COMPAT-07` | 2 | **Extended Formats & Split Volumes**: Unpack `.7z`, `.tar.gz`, `.tar.zst`, `.tar.bz2`, `.tar.xz` fixtures and RAR4/RAR5 corpus fixtures; pack PKWARE `.z01`/`.zip`, numeric `.zip.001` and `.7z.001` sets and unpack each from a middle volume; delete one volume | 100% SHA-256 match; RAR output matches libarchive `bsdtar` ≥ 3.6 when available (macOS/Linux); `overwrite: false` honoured; Info-ZIP `zip -s 0` merges the PKWARE set when available; missing volume reported by name |
 
 ---
 
@@ -68,9 +68,9 @@
 ### Category C — Security & Filesystem Edge Cases (20 pts — Must be 20/20)
 | ID | Weight | Test Scenario | Pass Criteria |
 |---|---:|---|---|
-| `SEC-01` | 5 | **Zip Slip Attacks**: `../evil.txt`, `a/../../evil.txt`, `/etc/evil`, `C:\Windows\evil.dll`, `..\\evil.txt` | All rejected with `UnsafePath`; zero files created outside destination |
+| `SEC-01` | 5 | **Zip Slip Attacks**: `../evil.txt`, `a/../../evil.txt`, `/etc/evil`, `C:\Windows\evil.dll`, `..\\evil.txt`, plus RAR4/RAR5 archives with a `../evil.txt` member | All rejected with `UnsafePath`; zero files created outside destination |
 | `SEC-02` | 5 | **Symlink Escape Attacks**: Symlink `out -> /tmp` followed by `out/pwned.txt`, plus absolute symlink `/etc/passwd` | Rejected with `UnsafeSymlink`; zero writes outside destination |
-| `SEC-03` | 4 | **Zip Bomb Defense**: 100 MB all-zeros compressed to ~100 KB tested against tight `SafetyBudget` | Rejected with `BudgetExceeded` before writing past budget; bounded RAM |
+| `SEC-03` | 4 | **Zip Bomb Defense**: 100 MB all-zeros compressed to ~100 KB, multi-entry ZIP, `.tar.gz` stream and RAR5 ratio bombs tested against tight `SafetyBudget` | Rejected with `BudgetExceeded` before writing past budget; bounded RAM |
 | `SEC-04` | 3 | **Windows Illegal Chars, Reserved Names & Long Paths**: `a:b*c?.txt`, `CON.txt`, `NUL`, `trailing. `, 280-char path | Sanitized deterministically without crashing on Windows; all files extracted cleanly |
 | `SEC-05` | 2 | **Case-Insensitive Collisions**: `Readme.md` + `README.md` in same folder | Both preserved (deterministic disambiguation), zero silent data loss |
 | `SEC-06` | 1 | **Corrupt / Truncated Archive Handling**: Truncated ZIP & bad CRC32 entry | Structured error returned (zero panic), partial output cleaned up |

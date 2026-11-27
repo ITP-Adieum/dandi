@@ -6,6 +6,7 @@ import type {
   DroppedPathsClassification,
   EncodingOption,
   OutputPathKind,
+  PackFormat,
   PackReport,
   PackRequestOptions,
   ProgressPayload,
@@ -16,7 +17,10 @@ import type {
 
 export const ARCHIVE_EXTENSIONS = [
   "zip",
+  "z01",
   "7z",
+  "rar",
+  "001",
   "tar",
   "tgz",
   "gz",
@@ -193,14 +197,18 @@ export async function pickDestinationDirectory(
   return typeof selected === "string" ? selected : null;
 }
 
-export async function pickSaveZipPath(
+export async function pickSaveArchivePath(
   defaultPath?: string,
-  title?: string
+  title?: string,
+  format: PackFormat = "zip"
 ): Promise<string | null> {
   const selected = await save({
     defaultPath,
     title,
-    filters: [{ name: "ZIP Archive", extensions: ["zip"] }],
+    filters:
+      format === "seven_z"
+        ? [{ name: "7z Archive", extensions: ["7z"] }]
+        : [{ name: "ZIP Archive", extensions: ["zip"] }],
   });
   return typeof selected === "string" ? selected : null;
 }

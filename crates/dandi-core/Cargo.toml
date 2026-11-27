@@ -13,7 +13,9 @@ crc32fast.workspace = true
 encoding_rs.workspace = true
 filetime.workspace = true
 flate2.workspace = true
+getrandom.workspace = true
 lzma-rust2.workspace = true
+rars.workspace = true
 rayon.workspace = true
 serde.workspace = true
 sevenz-rust2.workspace = true
@@ -27,6 +29,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+rars = { version = "0.13", default-features = false, features = ["encryption", "write"] }
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

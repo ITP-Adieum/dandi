@@ -18,10 +18,12 @@ dandi/
 │   │       ├── safety.rs       # Deep Module 2: Zip Slip, symlinks, Win paths, collisions, Zip Bomb
 │   │       ├── archive/        # Deep Module 3: Unified inspect / pack / unpack / repack_nfc
 │   │       │   ├── mod.rs      # Public ArchiveEngine interface + SmartExtract planner
-│   │       │   ├── extract_sink.rs # Unified disk-write sink (ZIP/TAR/7z): safety, atomic overwrite, warnings, rollback
-│   │       │   ├── format.rs   # Magic-byte + extension format detection
+│   │       │   ├── extract_sink.rs # Unified disk-write sink (ZIP/TAR/7z/RAR): safety, atomic overwrite, warnings, rollback
+│   │       │   ├── format.rs   # Magic-byte + extension format detection (split-volume aware)
+│   │       │   ├── split.rs    # Volume discovery, streaming SplitFileReader, numeric + PKWARE split writers
 │   │       │   ├── zip/        # Modular ZIP engine (header.rs, writer.rs, reader.rs, mod.rs)
-│   │       │   ├── sevenz.rs   # 7z reader (sevenz-rust2 -> ExtractionSink)
+│   │       │   ├── sevenz.rs   # 7z writer (AES-256, encrypted headers) + reader (sevenz-rust2 -> ExtractionSink)
+│   │       │   ├── rar_io.rs   # RAR4/RAR5 reader (pure-Rust `rars`, Apache-2.0 -> ExtractionSink)
 │   │       │   └── tar_io.rs   # tar / tar.gz / tar.zst / tar.bz2 / tar.xz reader (-> ExtractionSink)
 │   │       ├── progress.rs     # Cooperative CancellationToken + ProgressEvent sink
 │   │       └── platform.rs     # OS-specific adapters (Unix perms/symlinks, Windows \\?\ & Zone.ID)
@@ -84,11 +86,18 @@ dandi/
        - **Metadata**: DOS mtime + `0x5455` UTC Extended Timestamp; explicit Unix mode (`0644` files / `0755` dirs & executables, never `000`).
        - **Junk filter**: skips OS junk by default (`exclude_os_junk: true`).
        - **Optional Encryption**: WinZip AES-256 with UTF-8 NFC password.
+     - **`.7z` (`PackFormat::SevenZ`)**: one LZMA2 (or Copy for Smart-Store extensions) block per entry, NFC names, Unix mode and symlinks in 7-Zip's unix-extension attributes. With a password: 7z AES-256 (2^19 SHA-256 rounds, UTF-8 NFC) on every block **and** the header, so names are hidden too.
+     - **Split volumes** (`split_size_bytes` ≥ 64 KiB, see `parse_size_spec`):
+       - `SplitStyle::PkwareZip` (ZIP default): `.z01`, `.z02`, …, `.zip` per PKWARE APPNOTE §8.5 — `0x08074b50` at the start of disk 0, local headers / central-directory records / EOCD trailer never straddle volumes, per-disk `disk_number_start` and EOCD/ZIP64 disk fields. A set that fits one volume is written as a plain `.zip`.
+       - `SplitStyle::Numeric`: `.001`, `.002`, … byte-split (the only style for `.7z`).
+       - Volumes are staged as hidden sibling temps and renamed together on success; error or cancel deletes every staged volume, and a re-pack removes higher-numbered volumes of an older set.
   3. `unpack(archive_path: &Path, dest_dir: &Path, opts: &UnpackOptions, observer: &dyn ProgressObserver) -> Result<UnpackReport, DandiError>`
      - **Smart Extraction** (`ExtractMode::Smart` default):
        - Inspects top-level visible entries (ignoring `__MACOSX/`): 1 root directory → extract directly into `dest_dir` (conflict-checked); ≥2 top-level items or single loose file → wrap inside `<dest_dir>/<archive_stem>/`.
      - Supports selective extraction (`selected_entries: Option<HashSet<usize>>`).
-     - Formats: ZIP (Store, Deflate, Deflate64, Bzip2, Zstd, AES-256, ZipCrypto read, ZIP64), 7z, TAR (plain, `.gz`/`.tgz`, `.zst`/`.tzst`, `.bz2`, `.xz`).
+     - Formats: ZIP (Store, Deflate, Deflate64, Bzip2, Zstd, AES-256, ZipCrypto read, ZIP64), 7z (incl. AES-256 with encrypted headers), RAR4/RAR5 (incl. encrypted RAR5), TAR (plain, `.gz`/`.tgz`, `.zst`/`.tzst`, `.bz2`, `.xz`).
+     - **Split sets**: opening any volume (`.z01`, the final `.zip`, `.001`, `.002`, `.tar.gz.001`, `.part2.rar`, `.r00`) discovers the siblings and streams them through `SplitFileReader` (one OS handle at a time, no temp copy). PKWARE sets are read by overlaying a single-disk central directory on the concatenated volumes. A missing middle volume is a `CorruptArchive` error naming the file.
+     - **RAR**: `rars` gets only `Box<dyn Write>` sinks backed by `ExtractionSink` (never a destination path). Each file is finalized only after `rars` moves to the next member, so a member that fails its CRC is deleted rather than kept; hard links, junctions and file copies are refused; parser panics are caught and reported as `CorruptArchive`. RARLAB's UnRAR code is never linked (its licence forbids use in GPL software).
      - Preserves valid Unix `+x` bits and safe relative symlinks (so macOS `.app` bundles stay executable!).
      - Propagates `Zone.Identifier` ADS on Windows when present on source archive.
      - Cleans up partial extraction directory on cancellation if Dandi created it.

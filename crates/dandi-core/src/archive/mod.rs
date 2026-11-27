@@ -1,6 +1,8 @@
 pub(crate) mod extract_sink;
 pub mod format;
+pub mod rar_io;
 pub mod sevenz;
+pub mod split;
 pub mod tar_io;
 pub mod zip;
 
@@ -16,7 +18,19 @@ use crate::progress::{CancellationToken, ProgressObserver};
 use crate::safety::{is_os_junk, CollisionRename, PathPolicy, SafetyBudget};
 
 pub use format::{detect_format, ArchiveFormat};
+pub use split::{
+    parse_size_spec, validate_split_size, SplitFileReader, SplitStyle, MIN_SPLIT_SIZE_BYTES,
+};
 pub use zip::{inspect_zip_raw_headers, parse_zip_raw_headers_from_bytes, RawZipEntryHeader};
+
+/// Output container format for archive creation (`pack`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackFormat {
+    #[default]
+    Zip,
+    SevenZ,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,12 +81,18 @@ pub struct InspectOptions {
 
 #[derive(Clone, Debug)]
 pub struct PackOptions {
-    /// Deflate compression level (`0..=9`, default `6`).
+    /// Target archive container format (`Zip` default, or `SevenZ`).
+    pub format: PackFormat,
+    /// Compression level (`0..=9`, default `6`).
     pub compression_level: u32,
     /// Skip OS metadata junk (`.DS_Store`, `._*`, `__MACOSX`, `Icon\r`, `Thumbs.db`, `desktop.ini`).
     pub exclude_os_junk: bool,
-    /// Optional password for WinZip AES-256 encryption (UTF-8 NFC normalized).
+    /// Optional password for AES-256 encryption (UTF-8 NFC normalized).
     pub password: Option<String>,
+    /// Optional maximum split volume size in bytes (minimum 64 KiB when set).
+    pub split_size_bytes: Option<u64>,
+    /// Volume naming style (`PkwareZip` default for ZIP -> `.z01/.zip`; `Numeric` -> `.001/.002`).
+    pub split_style: SplitStyle,
     /// Overwrite destination archive if it already exists.
     pub overwrite: bool,
     /// Cooperative cancellation token.
@@ -82,9 +102,12 @@ pub struct PackOptions {
 impl Default for PackOptions {
     fn default() -> Self {
         Self {
+            format: PackFormat::Zip,
             compression_level: 6,
             exclude_os_junk: true,
             password: None,
+            split_size_bytes: None,
+            split_style: SplitStyle::PkwareZip,
             overwrite: true,
             cancel: CancellationToken::new(),
         }
@@ -94,6 +117,7 @@ impl Default for PackOptions {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PackReport {
     pub output_path: PathBuf,
+    pub output_volumes: Vec<PathBuf>,
     pub entries_written: usize,
     pub files_deflated: usize,
     pub files_stored: usize,
@@ -231,6 +255,7 @@ pub fn inspect(archive_path: &Path, opts: &InspectOptions) -> Result<ArchiveSumm
     match fmt {
         ArchiveFormat::Zip => zip::inspect_zip(archive_path, opts),
         ArchiveFormat::SevenZ => sevenz::inspect_7z(archive_path, opts),
+        ArchiveFormat::Rar => rar_io::inspect_rar(archive_path, opts),
         ArchiveFormat::Tar
         | ArchiveFormat::TarGz
         | ArchiveFormat::TarZst
@@ -239,17 +264,20 @@ pub fn inspect(archive_path: &Path, opts: &InspectOptions) -> Result<ArchiveSumm
     }
 }
 
-/// Packs input files/directories into a cross-OS Golden ZIP archive.
+/// Packs input files/directories into a cross-OS Golden ZIP or `.7z` archive (single or split).
 pub fn pack(
     inputs: &[PathBuf],
-    output_zip: &Path,
+    output_archive: &Path,
     opts: &PackOptions,
     observer: &dyn ProgressObserver,
 ) -> Result<PackReport> {
-    zip::pack_zip(inputs, output_zip, opts, observer)
+    match opts.format {
+        PackFormat::Zip => zip::pack_zip(inputs, output_archive, opts, observer),
+        PackFormat::SevenZ => sevenz::pack_7z(inputs, output_archive, opts, observer),
+    }
 }
 
-/// Unpacks any supported archive (ZIP, 7z, TAR.*) with safety guards and smart extraction.
+/// Unpacks any supported archive (ZIP, 7z, RAR, TAR.*, including split volumes) safely.
 pub fn unpack(
     archive_path: &Path,
     dest_dir: &Path,
@@ -260,6 +288,7 @@ pub fn unpack(
     match fmt {
         ArchiveFormat::Zip => zip::unpack_zip(archive_path, dest_dir, opts, observer),
         ArchiveFormat::SevenZ => sevenz::unpack_7z(archive_path, dest_dir, opts, observer),
+        ArchiveFormat::Rar => rar_io::unpack_rar(archive_path, dest_dir, opts, observer),
         ArchiveFormat::Tar
         | ArchiveFormat::TarGz
         | ArchiveFormat::TarZst
@@ -434,18 +463,51 @@ pub(crate) fn plan_extract_root(
     }
 }
 
+/// Folder name used by `Wrap`/`Smart` extraction; never empty or dots-only (`...part1.rar`
+/// would otherwise yield `..` and escape `dest_dir`).
 pub(crate) fn archive_stem(archive_path: &Path) -> String {
-    let file_name = archive_path
+    let stem = raw_archive_stem(archive_path);
+    if stem.trim_matches('.').trim().is_empty() {
+        "extracted".to_string()
+    } else {
+        stem
+    }
+}
+
+fn raw_archive_stem(archive_path: &Path) -> String {
+    let mut file_name = archive_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "extracted".to_string());
+
+    // Strip numeric split suffix (`.001`, `.002`, ...) first.
+    if let Some((base, ext)) = file_name.rsplit_once('.') {
+        if !base.is_empty() && ext.len() >= 3 && ext.bytes().all(|b| b.is_ascii_digit()) {
+            file_name = base.to_string();
+        }
+    }
+
     let lower = file_name.to_ascii_lowercase();
     for suffix in [".tar.gz", ".tar.zst", ".tar.bz2", ".tar.xz"] {
         if lower.ends_with(suffix) && file_name.len() > suffix.len() {
             return file_name[..file_name.len() - suffix.len()].to_string();
         }
     }
-    match archive_path.file_stem() {
+
+    // Strip `.partN.rar` multi-volume RAR suffix cleanly (e.g. `bundle.part01.rar` -> `bundle`).
+    if lower.ends_with(".rar") && file_name.len() > 4 {
+        let without_rar = &file_name[..file_name.len() - 4];
+        let lower_wo = &lower[..lower.len() - 4];
+        if let Some(pos) = lower_wo.rfind(".part") {
+            let digits = &lower_wo[pos + 5..];
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && pos > 0 {
+                return without_rar[..pos].to_string();
+            }
+        }
+        return without_rar.to_string();
+    }
+
+    match Path::new(&file_name).file_stem() {
         Some(s) if !s.is_empty() => s.to_string_lossy().into_owned(),
         _ => "extracted".to_string(),
     }
@@ -463,5 +525,25 @@ fn resolve_unique_dir(parent: &Path, base_name: &str, overwrite: bool) -> PathBu
             return candidate;
         }
         counter += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_stem_strips_split_and_multi_suffixes() {
+        assert_eq!(archive_stem(Path::new("/x/photos.part01.rar")), "photos");
+        assert_eq!(archive_stem(Path::new("/x/backup.zip.001")), "backup");
+        assert_eq!(archive_stem(Path::new("/x/logs.tar.gz.002")), "logs");
+        assert_eq!(archive_stem(Path::new("/x/set.z01")), "set");
+    }
+
+    #[test]
+    fn archive_stem_never_yields_a_parent_reference() {
+        for name in ["...part1.rar", "...tar.gz", "..rar", "...zip.001"] {
+            assert_eq!(archive_stem(Path::new(name)), "extracted", "{name}");
+        }
     }
 }

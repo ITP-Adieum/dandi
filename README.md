@@ -16,6 +16,7 @@ Sharing archives across macOS, Windows, and Linux still corrupts filenames and b
 
 - **macOS → Windows**: macOS writes Korean (`한` → `ㅎ+ㅏ+ㄴ`), Japanese dakuten (`が` → `か+゙`), European accents (`é`, `ü`, `ñ`), and Vietnamese tone marks as **Unicode NFD** and leaks `__MACOSX/`, `.DS_Store`, and `._*`. Dandi packs **Unicode NFC UTF-8** (ZIP Bit 11) with zero OS junk by default.
 - **Windows → macOS**: Legacy Windows ZIPs omit Bit 11 and store raw **CP949**, **Shift_JIS (incl. `0x5C` byte)**, **GB18030/GBK**, **Big5**, **Windows-1251/IBM866**, or **Windows-1252** bytes. Dandi runs **archive-wide corpus detection** independent of OS locale and offers a 1-click preview switcher and NFC repair (`dandi fix`).
+- **Big, private, or `.rar` files**: Splits archives into `.z01`/`.zip` (PKWARE) or `.001` volumes for mail and messenger limits, writes `.7z` with AES-256 that also hides file names, and opens RAR4/RAR5 with a pure-Rust, GPL-compatible reader — every extracted byte still goes through the same safety checks.
 - **Real-world edge cases & safety**: Writes UTC `0x5455` timestamps, preserves Unix `+x` modes and safe intra-archive relative symlinks, blocks **Zip Slip**, **symlink chaining**, and **Zip Bombs**, sanitizes Windows illegal characters and reserved names (`CON`, `NUL`, `COM1`–`9`), handles case-insensitive collisions without silent overwrite, and propagates Windows `Zone.Identifier` ADS.
 
 ---
@@ -26,9 +27,9 @@ Every change is graded by [`dandi-eval`](docs/EVAL_RUBRIC.md) against real nativ
 
 | Category | Score | Highlights |
 |---|---:|---|
-| Cross-OS Native Compatibility | **30 / 30** | Real macOS ↔ Windows Explorer round-trips, `.app` `+x` & symlinks, UTC `0x5455`, ZIP64, AES-256 Unicode passwords, `.7z`/`.tar.*` |
+| Cross-OS Native Compatibility | **30 / 30** | Real macOS ↔ Windows Explorer round-trips, `.app` `+x` & symlinks, UTC `0x5455`, ZIP64, ZIP & 7z AES-256 Unicode passwords, `.7z`/`.rar`/`.tar.*`, split `.z01`/`.001` sets (cross-checked with Info-ZIP & libarchive) |
 | Multilingual & Encoding Fidelity | **25 / 25** | All-script NFD → NFC, CP949, Shift_JIS (`0x5C`), GB18030, Big5, Cyrillic, `0x7075` CRC32 validation |
-| Security & Filesystem Safety | **20 / 20** | Zip Slip, symlink escape, Zip Bomb `SafetyBudget`, Windows reserved names & `MAX_PATH`, collision safety |
+| Security & Filesystem Safety | **20 / 20** | Zip Slip (ZIP & RAR), symlink escape, Zip Bomb `SafetyBudget` (ZIP, TAR & RAR), Windows reserved names & `MAX_PATH`, collision safety |
 | Performance & Efficiency | **15 / 15** | **454 MB/s** parallel Deflate pack (`rayon` + `zlib-rs`) + Smart Store; **718 MB/s** streaming unpack |
 | Reliability & Smart UX | **10 / 10** | Smart Extraction (no `foo/foo/` double-wrap or tarbombs), instant cancel & rollback, implicit dirs |
 | **Total** | **100 / 100** | **0 skipped, 0 security blockers** |
@@ -44,8 +45,18 @@ cargo install --path crates/dandi-cli
 # Pack files or folders into a clean cross-OS UTF-8 NFC ZIP (auto-excludes OS junk)
 dandi pack ./project -o project.zip
 
-# Unpack ZIP, 7z, or TAR (.tar/.tgz/.tar.gz/.tar.zst/.tar.bz2/.tar.xz) with Smart layout
+# Unpack ZIP, 7z, RAR, or TAR (.tar/.tgz/.tar.gz/.tar.zst/.tar.bz2/.tar.xz) with Smart layout
 dandi unpack archive.zip --dest ./out --mode smart
+
+# Split into 25 MB volumes: project.z01, project.z02, ..., project.zip (or --split-style numeric -> .001)
+dandi pack ./project -o project.zip --split 25M
+
+# High-compression .7z with AES-256 (file names encrypted too), split into .7z.001, .7z.002, ...
+dandi pack ./project -o project.7z --format 7z --password '단디-7z!2026' --split 100M
+
+# Open any volume of a split set, or a .rar / .part1.rar
+dandi unpack project.z01 --dest ./out
+dandi unpack photos.part2.rar --dest ./out
 
 # Inspect format, corpus-detected encoding, and synthesized folder tree
 dandi inspect legacy_cp949.zip
@@ -64,7 +75,7 @@ All commands also support `--json` for scripting and automation.
 
 ## Desktop App & Right-Click Shell Integration
 
-The Tauri v2 desktop app (`apps/desktop`) is a thin shell over `dandi-core` with drag-and-drop inspect/pack, live encoding switching, Smart/Direct/Wrap extraction, overwrite guard, expandable extraction warnings, and cancellation.
+The Tauri v2 desktop app (`apps/desktop`) is a thin shell over `dandi-core` with drag-and-drop inspect/pack, a ZIP (Max Compatibility) / 7z (High Compression + AES-256) format picker, split volumes (10 / 25 / 100 MB or custom), live encoding switching, Smart/Direct/Wrap extraction, overwrite guard, expandable extraction warnings, and cancellation.
 
 ### macOS Finder Quick Actions
 
@@ -90,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File .\packaging\windows\install-context-men
 powershell -ExecutionPolicy Bypass -File .\packaging\windows\uninstall-context-menu.ps1
 ```
 
-This adds **Compress with Dandi (Clean ZIP)** for files/folders and **Extract with Dandi (Smart)** + **Open in Dandi** for `.zip`, `.7z`, `.tar`, `.tgz`, `.gz`, `.zst`, `.bz2`, `.xz`, `.tzst`, `.tbz2`, and `.txz`.
+This adds **Compress with Dandi (Clean ZIP)** for files/folders and **Extract with Dandi (Smart)** + **Open in Dandi** for `.zip`, `.z01`, `.7z`, `.rar`, `.001`, `.tar`, `.tgz`, `.gz`, `.zst`, `.bz2`, `.xz`, `.tzst`, `.tbz2`, and `.txz`.
 
 ---
 
@@ -113,7 +124,7 @@ Pre-built releases may be unsigned while code-signing certificates are being pro
 ```text
 dandi/
 ├── crates/
-│   ├── dandi-core/    # Deep engine: codec (NFC/CP949/Shift_JIS/GB18030), safety, ExtractionSink, zip/7z/tar
+│   ├── dandi-core/    # Deep engine: codec (NFC/CP949/Shift_JIS/GB18030), safety, ExtractionSink, zip/7z/rar/tar, split volumes
 │   ├── dandi-cli/     # Thin CLI (`pack`, `unpack`, `list`, `inspect`, `fix`)
 │   └── dandi-eval/    # 100-point automated compatibility, security & performance harness
 ├── apps/
@@ -135,6 +146,7 @@ dandi/
 - [x] **M1 — Core Engine + CLI + Eval Harness**: `dandi-core`, `dandi-cli`, `dandi-eval` scoring **100/100** with real macOS ↔ Windows round-trips, hardened in M1.5 with `ExtractionSink`, structured warnings, and `SanitizedPath`.
 - [x] **M2 — Tauri v2 Desktop GUI**: Drag-and-drop inspect/pack, archive tree preview, 1-click legacy encoding switcher, NFC repair, smart extraction, progress & clean cancellation.
 - [x] **M3 — OS Shell Integration & Automated Releases**: Desktop warning/overwrite UX, macOS Finder Quick Actions, Windows HKCU Explorer context menu, cross-OS GitHub release pipeline with SHA-256 checksums, and multilingual OSS docs.
+- [x] **M4 — Split Volumes, .7z Creation & .rar Reading**: PKWARE `.z01`/`.zip` and numeric `.001` split write/read with streaming volume discovery, `.7z` packing with AES-256 + encrypted names, RAR4/RAR5 extraction via the pure-Rust `rars` crate (no RARLAB code), desktop format & split pickers.
 
 ---
 
@@ -148,3 +160,4 @@ dandi/
 - **Source Code**: Licensed under the [GNU General Public License v3.0](LICENSE) (`GPL-3.0-only`) © [ITP-Adieum](https://github.com/ITP-Adieum). Free for personal and commercial/company use.
 - **Trademark**: The **Dandi** name and logo are trademarks of ITP-Adieum and are not covered by the GPL-3.0 license. Forks must use a distinct name and icon.
 - **Commercial / Dual Licensing**: Commercial redistribution or proprietary embedding licenses are available from ITP-Adieum.
+- **RAR support**: `.rar` reading uses the Apache-2.0 [`rars`](https://crates.io/crates/rars) crate. Dandi contains no RARLAB UnRAR code, whose license is incompatible with the GPL; Dandi cannot create `.rar` archives.

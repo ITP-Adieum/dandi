@@ -20,7 +20,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ArchiveExtensions = @(
-    ".zip", ".7z", ".tar", ".tgz", ".gz",
+    ".zip", ".7z", ".rar", ".z01", ".001", ".tar", ".tgz", ".gz",
     ".zst", ".bz2", ".xz", ".tzst", ".tbz2", ".txz"
 )
 

@@ -7,7 +7,11 @@ use unicode_normalization::UnicodeNormalization;
 use zip::ZipArchive;
 
 use crate::archive::extract_sink::ExtractionSink;
-use crate::archive::zip::header::{compression_method_name, read_zip_raw_entries};
+use crate::archive::split::{discover_volumes, SplitFileReader, VolumeKind};
+use crate::archive::zip::header::{
+    build_normalized_single_disk_tail, compression_method_name, read_pkware_split_directory,
+    read_single_disk_directory, ParsedZipDirectory, RawZipEntryHeader,
+};
 use crate::archive::{
     plan_extract_root, synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary,
     EntryKind, InspectOptions, UnpackOptions, UnpackReport,
@@ -20,10 +24,180 @@ use crate::safety::{is_os_junk, sanitize_entry_path};
 
 const STREAM_BUF_SIZE: usize = 256 * 1024;
 
+/// Streaming `Read + Seek` overlay for PKWARE multi-disk split ZIPs:
+/// serves bytes `[0 .. overlay_start)` directly from `SplitFileReader` (zero full-archive copy)
+/// and bytes `[overlay_start .. total_len)` from the normalized single-disk Central Directory + EOCD.
+pub(crate) struct SplitZipVirtualReader {
+    base: SplitFileReader,
+    overlay_start: u64,
+    overlay: Vec<u8>,
+    pos: u64,
+}
+
+impl SplitZipVirtualReader {
+    fn new(base: SplitFileReader, overlay_start: u64, overlay: Vec<u8>) -> Self {
+        Self {
+            base,
+            overlay_start,
+            overlay,
+            pos: 0,
+        }
+    }
+
+    fn virtual_len(&self) -> u64 {
+        self.overlay_start.saturating_add(self.overlay.len() as u64)
+    }
+}
+
+impl Read for SplitZipVirtualReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let vlen = self.virtual_len();
+        if self.pos >= vlen {
+            return Ok(0);
+        }
+        if self.pos < self.overlay_start {
+            let max_from_base = (self.overlay_start - self.pos).min(buf.len() as u64) as usize;
+            self.base.seek(SeekFrom::Start(self.pos))?;
+            let n = self.base.read(&mut buf[..max_from_base])?;
+            self.pos += n as u64;
+            Ok(n)
+        } else {
+            let rel = (self.pos - self.overlay_start) as usize;
+            let avail = self.overlay.len().saturating_sub(rel);
+            let n = buf.len().min(avail);
+            buf[..n].copy_from_slice(&self.overlay[rel..rel + n]);
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+}
+
+impl Seek for SplitZipVirtualReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let vlen = self.virtual_len();
+        let target: i128 = match pos {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::End(delta) => (vlen as i128) + (delta as i128),
+            SeekFrom::Current(delta) => (self.pos as i128) + (delta as i128),
+        };
+        if target < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot seek before start of virtual split ZIP",
+            ));
+        }
+        self.pos = u64::try_from(target)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seek offset overflow"))?;
+        Ok(self.pos)
+    }
+}
+
+/// Unified streaming `Read + Seek` backend for single-file, numeric-split, and PKWARE-split ZIPs.
+pub(crate) enum ZipStreamSource {
+    Single(BufReader<File>),
+    Numeric(BufReader<SplitFileReader>),
+    PkwareVirtual(BufReader<SplitZipVirtualReader>),
+}
+
+impl Read for ZipStreamSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Single(r) => r.read(buf),
+            Self::Numeric(r) => r.read(buf),
+            Self::PkwareVirtual(r) => r.read(buf),
+        }
+    }
+}
+
+impl Seek for ZipStreamSource {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Single(r) => r.seek(pos),
+            Self::Numeric(r) => r.seek(pos),
+            Self::PkwareVirtual(r) => r.seek(pos),
+        }
+    }
+}
+
+pub(crate) struct OpenedZipArchive {
+    pub raw_headers: Vec<RawZipEntryHeader>,
+    pub archive_total_size: u64,
+    pub stream: ZipStreamSource,
+}
+
+/// Opens a single-file, numeric-split (`.zip.001`), or PKWARE-split (`.z01`/`.zip`) ZIP archive
+/// for streaming inspection and extraction without copying the archive to a temporary file.
+pub(crate) fn open_zip_source(archive_path: &Path, max_entries: usize) -> Result<OpenedZipArchive> {
+    let vol_set = discover_volumes(archive_path)?;
+    match vol_set.kind {
+        VolumeKind::Single => {
+            let fs_archive = to_fs_path(archive_path);
+            let archive_total_size = fs::metadata(&fs_archive)
+                .map(|m| m.len())
+                .unwrap_or(1)
+                .max(1);
+            let mut file = File::open(&fs_archive).map_err(|e| DandiError::io(archive_path, e))?;
+            let parsed = read_single_disk_directory(&mut file, max_entries)?;
+            reject_orphan_split_volume(archive_path, &parsed)?;
+            file.seek(SeekFrom::Start(0))?;
+            Ok(OpenedZipArchive {
+                raw_headers: parsed.headers,
+                archive_total_size,
+                stream: ZipStreamSource::Single(BufReader::with_capacity(STREAM_BUF_SIZE, file)),
+            })
+        }
+        VolumeKind::Numeric => {
+            let mut split = SplitFileReader::open(&vol_set.volumes)?;
+            let archive_total_size = split.total_len().max(1);
+            let parsed = read_single_disk_directory(&mut split, max_entries)?;
+            reject_orphan_split_volume(archive_path, &parsed)?;
+            split.seek(SeekFrom::Start(0))?;
+            Ok(OpenedZipArchive {
+                raw_headers: parsed.headers,
+                archive_total_size,
+                stream: ZipStreamSource::Numeric(BufReader::with_capacity(STREAM_BUF_SIZE, split)),
+            })
+        }
+        VolumeKind::PkwareZip => {
+            let mut split = SplitFileReader::open(&vol_set.volumes)?;
+            let archive_total_size = split.total_len().max(1);
+            let parsed = read_pkware_split_directory(&mut split, max_entries)?;
+            let overlay = build_normalized_single_disk_tail(&parsed, &split)?;
+            let overlay_start = parsed.cd_global_offset;
+            let raw_headers = parsed.headers;
+            split.seek(SeekFrom::Start(0))?;
+            let virtual_reader = SplitZipVirtualReader::new(split, overlay_start, overlay);
+            Ok(OpenedZipArchive {
+                raw_headers,
+                archive_total_size,
+                stream: ZipStreamSource::PkwareVirtual(BufReader::with_capacity(
+                    STREAM_BUF_SIZE,
+                    virtual_reader,
+                )),
+            })
+        }
+    }
+}
+
+/// A single-file read of a multi-disk EOCD means the other PKWARE volumes were not discovered
+/// (e.g. the final volume was renamed away from `.zip`).
+fn reject_orphan_split_volume(archive_path: &Path, parsed: &ParsedZipDirectory) -> Result<()> {
+    if parsed.number_of_this_disk != 0 || parsed.disk_with_central_dir != 0 {
+        return Err(DandiError::CorruptArchive(format!(
+            "'{}' is volume {} of a split ZIP; keep its .z01, .z02, ... volumes next to a final .zip volume",
+            archive_path.display(),
+            parsed.number_of_this_disk + 1
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn inspect_zip(archive_path: &Path, opts: &InspectOptions) -> Result<ArchiveSummary> {
-    let fs_path = to_fs_path(archive_path);
-    let mut file = File::open(&fs_path).map_err(|e| DandiError::io(archive_path, e))?;
-    let raw_headers = read_zip_raw_entries(&mut file, opts.budget.max_entries)?;
+    let opened = open_zip_source(archive_path, opts.budget.max_entries)?;
+    let raw_headers = opened.raw_headers;
 
     let non_bit11_names: Vec<&[u8]> = raw_headers
         .iter()
@@ -104,13 +278,9 @@ pub(crate) fn unpack_zip(
     observer: &dyn ProgressObserver,
 ) -> Result<UnpackReport> {
     opts.cancel.check()?;
-    let fs_archive = to_fs_path(archive_path);
-    let archive_file_size = fs::metadata(&fs_archive)
-        .map(|m| m.len())
-        .unwrap_or(1)
-        .max(1);
-    let mut raw_file = File::open(&fs_archive).map_err(|e| DandiError::io(archive_path, e))?;
-    let raw_headers = read_zip_raw_entries(&mut raw_file, opts.budget.max_entries)?;
+    let opened = open_zip_source(archive_path, opts.budget.max_entries)?;
+    let raw_headers = opened.raw_headers;
+    let archive_file_size = opened.archive_total_size;
 
     let non_bit11_names: Vec<&[u8]> = raw_headers
         .iter()
@@ -200,10 +370,7 @@ pub(crate) fn unpack_zip(
     )?;
 
     let mut sink = ExtractionSink::new(plan, opts, budget, zone_data)?;
-
-    raw_file.seek(SeekFrom::Start(0))?;
-    let mut archive = ZipArchive::new(BufReader::with_capacity(STREAM_BUF_SIZE, raw_file))
-        .map_err(map_zip_error)?;
+    let mut archive = ZipArchive::new(opened.stream).map_err(map_zip_error)?;
 
     let bytes_total_planned: u64 = planned
         .iter()

@@ -12,9 +12,10 @@ pub mod progress;
 pub mod safety;
 
 pub use archive::{
-    detect_format, inspect, pack, repack_nfc, unpack, ArchiveEntryInfo, ArchiveFormat,
-    ArchiveSummary, EntryKind, ExtractMode, InspectOptions, PackOptions, PackReport, RepackOptions,
-    RepackReport, UnpackOptions, UnpackReport, UnpackWarning,
+    detect_format, inspect, pack, parse_size_spec, repack_nfc, unpack, validate_split_size,
+    ArchiveEntryInfo, ArchiveFormat, ArchiveSummary, EntryKind, ExtractMode, InspectOptions,
+    PackFormat, PackOptions, PackReport, RepackOptions, RepackReport, SplitFileReader, SplitStyle,
+    UnpackOptions, UnpackReport, UnpackWarning, MIN_SPLIT_SIZE_BYTES,
 };
 pub use codec::{
     decode_entry_name, detect_archive_encoding, normalize_for_pack, supported_encodings,

@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dandi_core::{
-    detect_format, inspect, pack, repack_nfc, supported_encodings, unpack, ArchiveSummary,
-    CancellationToken, EncodingId, ExtractMode, InspectOptions, PackOptions, PackReport,
-    ProgressEvent, ProgressObserver, ProgressPhase, RepackOptions, RepackReport,
-    ThrottledProgressObserver, UnpackOptions, UnpackReport,
+    detect_format, inspect, pack, parse_size_spec, repack_nfc, supported_encodings, unpack,
+    ArchiveSummary, CancellationToken, EncodingId, ExtractMode, InspectOptions, PackFormat,
+    PackOptions, PackReport, ProgressEvent, ProgressObserver, ProgressPhase, RepackOptions,
+    RepackReport, SplitStyle, ThrottledProgressObserver, UnpackOptions, UnpackReport,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -104,9 +104,13 @@ fn describe_encoding(id: EncodingId) -> EncodingOption {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct PackRequestOptions {
     pub op_id: Option<String>,
+    pub format: Option<PackFormat>,
     pub compression_level: Option<u32>,
     pub exclude_os_junk: Option<bool>,
     pub password: Option<String>,
+    /// Volume size such as `25M`; parsed by `dandi_core::parse_size_spec`.
+    pub split_size: Option<String>,
+    pub split_style: Option<SplitStyle>,
     pub overwrite: Option<bool>,
 }
 
@@ -173,10 +177,20 @@ pub(crate) fn pack_archive_impl(
             "at least one file or folder is required to create an archive",
         ));
     }
+    let split_size_bytes = options
+        .split_size
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_size_spec)
+        .transpose()?;
     let opts = PackOptions {
+        format: options.format.unwrap_or_default(),
         compression_level: options.compression_level.unwrap_or(6).min(9),
         exclude_os_junk: options.exclude_os_junk.unwrap_or(true),
         password: normalize_password(options.password),
+        split_size_bytes,
+        split_style: options.split_style.unwrap_or_default(),
         overwrite: options.overwrite.unwrap_or(true),
         cancel,
     };
@@ -602,6 +616,101 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Cancelled);
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn pack_request_options_deserialize_from_frontend_json() {
+        let opts: PackRequestOptions = serde_json::from_value(serde_json::json!({
+            "op_id": "op-1",
+            "format": "seven_z",
+            "split_size": "25M",
+            "split_style": "numeric",
+            "password": "pw",
+        }))
+        .unwrap();
+        assert_eq!(opts.format, Some(PackFormat::SevenZ));
+        assert_eq!(opts.split_size.as_deref(), Some("25M"));
+        assert_eq!(opts.split_style, Some(SplitStyle::Numeric));
+    }
+
+    #[test]
+    fn pack_archive_impl_writes_split_7z_and_rejects_bad_sizes() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("영상");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut state = 0x9E37_79B9_u64;
+        let noise: Vec<u8> = (0..200_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        std::fs::write(src.join("clip.mp4"), &noise).unwrap();
+
+        let out = dir.path().join("영상.7z");
+        let report = pack_archive_impl(
+            std::slice::from_ref(&src),
+            &out,
+            PackRequestOptions {
+                format: Some(PackFormat::SevenZ),
+                split_size: Some("64K".into()),
+                password: Some("단디-7z!2026".into()),
+                ..PackRequestOptions::default()
+            },
+            CancellationToken::new(),
+            &NoopProgressObserver,
+        )
+        .unwrap();
+        assert!(report.encrypted);
+        assert!(report.output_volumes.len() >= 3);
+        assert!(report.output_path.ends_with("영상.7z.001"));
+
+        let unpacked = unpack_archive_impl(
+            &report.output_volumes[1],
+            &dir.path().join("x"),
+            UnpackRequestOptions {
+                password: Some("단디-7z!2026".into()),
+                ..UnpackRequestOptions::default()
+            },
+            CancellationToken::new(),
+            &NoopProgressObserver,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(unpacked.output_dir.join("clip.mp4")).unwrap(),
+            noise
+        );
+
+        for bad in ["10X", "1K"] {
+            let err = pack_archive_impl(
+                std::slice::from_ref(&src),
+                &dir.path().join("bad.zip"),
+                PackRequestOptions {
+                    split_size: Some(bad.into()),
+                    ..PackRequestOptions::default()
+                },
+                CancellationToken::new(),
+                &NoopProgressObserver,
+            )
+            .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::InvalidInput, "{bad}");
+        }
+
+        // Blank size means "no split".
+        let plain = pack_archive_impl(
+            std::slice::from_ref(&src),
+            &dir.path().join("plain.zip"),
+            PackRequestOptions {
+                split_size: Some("  ".into()),
+                ..PackRequestOptions::default()
+            },
+            CancellationToken::new(),
+            &NoopProgressObserver,
+        )
+        .unwrap();
+        assert_eq!(plain.output_volumes.len(), 1);
     }
 
     #[test]

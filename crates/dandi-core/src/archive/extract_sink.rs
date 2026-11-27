@@ -55,8 +55,33 @@ impl Drop for DirCleanupGuard {
     }
 }
 
+/// Active output file opened via [`ExtractionSink::begin_file`] for streaming pull or push writes.
+///
+/// Automatically deletes the partial file on `Drop` unless finalized via [`ExtractionSink::finish_file`].
+pub(crate) struct StagedFileHandle {
+    out_path: PathBuf,
+    fs_out: PathBuf,
+    resolved_norm: String,
+    eff_norm: String,
+    writer: Option<BufWriter<fs::File>>,
+    entry_compressed_hint: u64,
+    entry_written: u64,
+    mtime: Option<i64>,
+    unix_mode: Option<u32>,
+    finalized: bool,
+}
+
+impl Drop for StagedFileHandle {
+    fn drop(&mut self) {
+        if !self.finalized {
+            self.writer = None;
+            let _ = fs::remove_file(&self.fs_out);
+        }
+    }
+}
+
 /// Unified deep module responsible for all filesystem writes during archive extraction across
-/// ZIP, TAR, and 7z.
+/// ZIP, TAR, 7z, and RAR.
 ///
 /// Centralizes path sanitization, case-insensitive collision disambiguation, symlink ancestor
 /// & chaining checks, atomic `overwrite: false` enforcement, budgeted streaming writes,
@@ -130,6 +155,10 @@ impl ExtractionSink {
         self.budget.bytes_written()
     }
 
+    pub fn check_cancelled(&self) -> Result<()> {
+        self.cancel.check()
+    }
+
     /// Pre-registers a symlink declared in the archive before any files are extracted,
     /// validating that its target does not escape `extract_root`.
     pub fn register_declared_symlink(&mut self, decoded_path: &str, target: &str) -> Result<()> {
@@ -154,7 +183,7 @@ impl ExtractionSink {
         Ok(())
     }
 
-    /// Accounts for uncompressed bytes of skipped entries (e.g. solid 7z blocks) in the budget.
+    /// Accounts for uncompressed bytes of skipped entries (e.g. solid 7z/RAR blocks) in the budget.
     pub fn record_skipped_bytes(&mut self, bytes: u64, compressed_hint: u64) -> Result<()> {
         if bytes > 0 {
             self.budget
@@ -228,23 +257,15 @@ impl ExtractionSink {
         Ok(Some(eff.normalized().to_string()))
     }
 
-    /// Extracts a single regular file entry from `reader` with full safety, budget, atomic
-    /// `overwrite: false`, cancellation, and metadata/warning handling.
-    #[allow(clippy::too_many_arguments)]
-    pub fn extract_file<R, F>(
+    /// Opens a sanitized, collision-resolved, atomic output file ready for budgeted chunk writes.
+    pub fn begin_file(
         &mut self,
         decoded_path: &str,
-        reader: &mut R,
         entry_compressed_hint: u64,
         note_live_compressed: bool,
         mtime: Option<i64>,
         unix_mode: Option<u32>,
-        map_read_err: F,
-    ) -> Result<Option<String>>
-    where
-        R: Read + ?Sized,
-        F: Fn(io::Error) -> DandiError,
-    {
+    ) -> Result<Option<StagedFileHandle>> {
         self.cancel.check()?;
         let Some(eff) = self.prepare_effective_path(decoded_path, true)? else {
             return Ok(None);
@@ -292,62 +313,126 @@ impl ExtractionSink {
                 })?
         };
 
-        let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, out_file);
-        let mut entry_written = 0u64;
+        Ok(Some(StagedFileHandle {
+            out_path,
+            fs_out,
+            resolved_norm: resolved.normalized().to_string(),
+            eff_norm: eff.normalized().to_string(),
+            writer: Some(BufWriter::with_capacity(STREAM_BUF_SIZE, out_file)),
+            entry_compressed_hint,
+            entry_written: 0,
+            mtime,
+            unix_mode,
+            finalized: false,
+        }))
+    }
 
-        let stream_res: Result<()> = (|| {
-            loop {
-                self.cancel.check()?;
-                let n = match reader.read(&mut self.read_buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) => return Err(map_read_err(e)),
-                };
-                entry_written = entry_written.saturating_add(n as u64);
-                self.budget
-                    .record_written_bytes(n as u64, entry_written, entry_compressed_hint)?;
-                writer
-                    .write_all(&self.read_buf[..n])
-                    .map_err(|e| DandiError::io(&out_path, e))?;
-            }
-            writer.flush().map_err(|e| DandiError::io(&out_path, e))?;
-            Ok(())
-        })();
-
-        drop(writer);
-        if let Err(err) = stream_res {
-            let _ = fs::remove_file(&fs_out);
-            return Err(err);
+    /// Writes a chunk to an open [`StagedFileHandle`], enforcing `CancellationToken` and `SafetyBudget`.
+    pub fn write_file_chunk(&mut self, handle: &mut StagedFileHandle, chunk: &[u8]) -> Result<()> {
+        self.cancel.check()?;
+        if chunk.is_empty() {
+            return Ok(());
         }
+        handle.entry_written = handle.entry_written.saturating_add(chunk.len() as u64);
+        self.budget.record_written_bytes(
+            chunk.len() as u64,
+            handle.entry_written,
+            handle.entry_compressed_hint,
+        )?;
+        let Some(ref mut writer) = handle.writer else {
+            return Err(DandiError::ArchiveEngine(
+                "attempted write to closed extraction file handle".to_string(),
+            ));
+        };
+        writer
+            .write_all(chunk)
+            .map_err(|e| DandiError::io(&handle.out_path, e))
+    }
 
-        let resolved_norm = resolved.normalized().to_string();
-        if let Some(mode) = unix_mode {
-            if let Err(e) = apply_unix_mode(&out_path, mode, false) {
+    /// Flushes and closes a [`StagedFileHandle`], applying Unix permissions, UTC mtime, and Windows ADS.
+    pub fn finish_file(&mut self, mut handle: StagedFileHandle) -> Result<String> {
+        if let Some(mut writer) = handle.writer.take() {
+            writer
+                .flush()
+                .map_err(|e| DandiError::io(&handle.out_path, e))?;
+        }
+        handle.finalized = true;
+
+        if let Some(mode) = handle.unix_mode {
+            if let Err(e) = apply_unix_mode(&handle.out_path, mode, false) {
                 self.warnings.push(UnpackWarning::PermissionApplyFailed {
-                    path: resolved_norm.clone(),
+                    path: handle.resolved_norm.clone(),
                     reason: e.to_string(),
                 });
             }
         }
-        if let Some(ts) = mtime {
-            if let Err(e) = set_mtime(&out_path, ts, false) {
+        if let Some(ts) = handle.mtime {
+            if let Err(e) = set_mtime(&handle.out_path, ts, false) {
                 self.warnings.push(UnpackWarning::MtimeApplyFailed {
-                    path: resolved_norm.clone(),
+                    path: handle.resolved_norm.clone(),
                     reason: e.to_string(),
                 });
             }
         }
         if let Some(ref zdata) = self.zone_data {
-            if let Err(e) = write_zone_identifier(&out_path, zdata) {
+            if let Err(e) = write_zone_identifier(&handle.out_path, zdata) {
                 self.warnings.push(UnpackWarning::ZoneIdPropagateFailed {
-                    path: resolved_norm,
+                    path: handle.resolved_norm.clone(),
                     reason: e.to_string(),
                 });
             }
         }
 
         self.files_extracted += 1;
-        Ok(Some(eff.normalized().to_string()))
+        Ok(handle.eff_norm.clone())
+    }
+
+    /// Extracts a single regular file entry from `reader` with full safety, budget, atomic
+    /// `overwrite: false`, cancellation, and metadata/warning handling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn extract_file<R, F>(
+        &mut self,
+        decoded_path: &str,
+        reader: &mut R,
+        entry_compressed_hint: u64,
+        note_live_compressed: bool,
+        mtime: Option<i64>,
+        unix_mode: Option<u32>,
+        map_read_err: F,
+    ) -> Result<Option<String>>
+    where
+        R: Read + ?Sized,
+        F: Fn(io::Error) -> DandiError,
+    {
+        let Some(mut handle) = self.begin_file(
+            decoded_path,
+            entry_compressed_hint,
+            note_live_compressed,
+            mtime,
+            unix_mode,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let mut buf = std::mem::take(&mut self.read_buf);
+        let stream_res: Result<()> = (|| {
+            loop {
+                self.cancel.check()?;
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => return Err(map_read_err(e)),
+                };
+                self.write_file_chunk(&mut handle, &buf[..n])?;
+            }
+            Ok(())
+        })();
+        self.read_buf = buf;
+
+        stream_res?;
+        let eff_norm = self.finish_file(handle)?;
+        Ok(Some(eff_norm))
     }
 
     /// Finalizes extraction: materializes Phase-2 symlinks, applies deferred bottom-up directory

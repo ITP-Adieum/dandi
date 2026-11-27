@@ -11,7 +11,15 @@ import {
 } from "lucide-react";
 import type { Dictionary } from "../i18n";
 import { pathBasename } from "../lib/format";
+import {
+  PACK_FORMATS,
+  SPLIT_PRESETS,
+  splitSizeSpec,
+  withArchiveExtension,
+  type SplitPreset,
+} from "../lib/pack";
 import type { PackDraftState } from "../lib/state";
+import type { PackFormat } from "../types";
 
 interface PackModalProps {
   t: Dictionary;
@@ -36,7 +44,21 @@ export function PackModal({
 }: PackModalProps) {
   const [showPassword, setShowPassword] = useState(false);
 
-  const canSubmit = draft.inputs.length > 0 && draft.outputZip.trim().length > 0;
+  const splitValid = splitSizeSpec(draft.splitPreset, draft.splitCustomMb).ok;
+  const canSubmit =
+    draft.inputs.length > 0 && draft.outputZip.trim().length > 0 && splitValid;
+
+  const formatLabel = (format: PackFormat) =>
+    format === "zip" ? t.formatZip : t.format7z;
+  const splitLabel = (preset: SplitPreset) => {
+    if (preset === "none") return t.splitNone;
+    if (preset === "custom") return t.splitCustom;
+    return `${preset} MB`;
+  };
+  const chooseFormat = (format: PackFormat) => {
+    if (format === draft.format) return;
+    onUpdate({ format, outputZip: withArchiveExtension(draft.outputZip, format) });
+  };
 
   return (
     <div
@@ -180,6 +202,103 @@ export function PackModal({
             </div>
           </div>
 
+          {/* Archive format */}
+          <div>
+            <span
+              className="mb-1.5 block font-medium"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              {t.archiveFormat}
+            </span>
+            <div className="grid grid-cols-2 gap-1.5" role="radiogroup" aria-label={t.archiveFormat}>
+              {PACK_FORMATS.map((format) => {
+                const active = draft.format === format;
+                return (
+                  <button
+                    key={format}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => chooseFormat(format)}
+                    className="rounded-md border px-2.5 py-1.5 text-left text-xs font-medium transition-colors"
+                    style={{
+                      borderColor: active ? "var(--accent-border)" : "var(--border-subtle)",
+                      backgroundColor: active ? "var(--accent-soft)" : "var(--bg-app)",
+                      color: active ? "var(--text-primary)" : "var(--text-secondary)",
+                    }}
+                  >
+                    {formatLabel(format)}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
+              {draft.format === "zip" ? t.formatZipHint : t.format7zHint}
+            </div>
+          </div>
+
+          {/* Split volumes */}
+          <div>
+            <span
+              className="mb-1.5 block font-medium"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              {t.splitVolumes}
+            </span>
+            <div className="grid grid-cols-5 gap-1.5" role="radiogroup" aria-label={t.splitVolumes}>
+              {SPLIT_PRESETS.map((preset) => {
+                const active = draft.splitPreset === preset;
+                return (
+                  <button
+                    key={preset}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => onUpdate({ splitPreset: preset })}
+                    className="rounded-md border px-1.5 py-1.5 text-[11px] font-medium transition-colors"
+                    style={{
+                      borderColor: active ? "var(--accent-border)" : "var(--border-subtle)",
+                      backgroundColor: active ? "var(--accent-soft)" : "var(--bg-app)",
+                      color: active ? "var(--text-primary)" : "var(--text-secondary)",
+                    }}
+                  >
+                    {splitLabel(preset)}
+                  </button>
+                );
+              })}
+            </div>
+            {draft.splitPreset === "custom" && (
+              <div className="mt-1.5 flex items-center gap-2">
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={draft.splitCustomMb}
+                  onChange={(e) => onUpdate({ splitCustomMb: e.target.value })}
+                  placeholder={t.splitCustomPlaceholder}
+                  aria-label={t.splitCustom}
+                  aria-invalid={!splitValid}
+                  className="font-mono-tabular w-28 rounded-md border px-2.5 py-1.5 text-xs outline-none focus:border-[var(--accent)]"
+                  style={{
+                    backgroundColor: "var(--bg-app)",
+                    borderColor: splitValid ? "var(--border-subtle)" : "var(--warn-border)",
+                    color: "var(--text-primary)",
+                  }}
+                />
+                <span style={{ color: "var(--text-muted)" }}>MB</span>
+                {!splitValid && (
+                  <span className="text-[11px]" style={{ color: "var(--warn-text)" }}>
+                    {t.splitInvalid}
+                  </span>
+                )}
+              </div>
+            )}
+            {draft.splitPreset !== "none" && (
+              <div className="mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
+                {draft.format === "zip" ? t.splitHintZip : t.splitHint7z}
+              </div>
+            )}
+          </div>
+
           {/* Compression level */}
           <div>
             <span
@@ -278,7 +397,7 @@ export function PackModal({
               }}
             >
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>{t.aesWindowsWarning}</span>
+              <span>{draft.format === "zip" ? t.aesWindowsWarning : t.format7zHint}</span>
             </div>
           </div>
         </div>
