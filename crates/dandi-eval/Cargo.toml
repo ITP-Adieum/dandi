@@ -1,0 +1,31 @@
+[package]
+name = "dandi-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Autonomous 100-point cross-OS evaluation harness for Dandi"
+
+[[bin]]
+name = "dandi-eval"
+path = "src/main.rs"
+
+[dependencies]
+bzip2.workspace = true
+clap.workspace = true
+crc32fast.workspace = true
+dandi-core = { path = "../dandi-core" }
+flate2.workspace = true
+lzma-rust2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sevenz-rust2.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+unicode-normalization.workspace = true
+walkdir.workspace = true
+zstd.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
