@@ -1049,17 +1049,16 @@ fn rar_corpus(name: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// libarchive's `bsdtar` (macOS/BSD) or Windows' built-in `tar.exe`: an independent RAR reader.
+/// libarchive's `bsdtar`, an independent RAR reader, when it is libarchive >= 3.6.
 ///
-/// Only libarchive >= 3.6 is used: the 3.5.x RAR5 reader shipped with Windows 10 rejects small
-/// RAR5 members ("Truncated data in huffman tables") that libarchive 3.7, `rars` and WinRAR read.
+/// Windows' `tar.exe` is not used: it maps entry names through the ANSI code page and skips
+/// Korean/Japanese names on other locales, and its 3.5.x RAR5 reader rejects small members
+/// ("Truncated data in huffman tables") that libarchive 3.7, `rars` and WinRAR read.
 fn libarchive_tar() -> Option<PathBuf> {
-    let candidate = if cfg!(windows) {
-        let system_root = std::env::var_os("SystemRoot")?;
-        PathBuf::from(system_root).join("System32").join("tar.exe")
-    } else {
-        PathBuf::from("bsdtar")
-    };
+    if cfg!(windows) {
+        return None;
+    }
+    let candidate = PathBuf::from("bsdtar");
     let out = Command::new(&candidate).arg("--version").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let version = text
@@ -1072,8 +1071,7 @@ fn libarchive_tar() -> Option<PathBuf> {
     (major > 3 || (major == 3 && minor >= 6)).then_some(candidate)
 }
 
-/// Sorted content hashes: names are compared on macOS by the core tests, while Windows
-/// console code pages can mangle what `tar.exe` reports.
+/// Sorted content hashes; entry names are compared by the core `rar_read` tests.
 fn content_hashes(root: &Path) -> Result<Vec<String>, String> {
     let mut hashes: Vec<String> = hash_directory(root)?.into_values().collect();
     hashes.sort();

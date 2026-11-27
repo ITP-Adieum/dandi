@@ -47,7 +47,7 @@
 | `COMPAT-04` | 4 | **UTC Timestamp Fidelity (`0x5455`)**: Pack files with explicit mtimes; inspect raw ZIP headers + verify unpacked mtime within ≤ 2s | `0x5455` UTC extra field present; no timezone shift on unpack |
 | `COMPAT-05` | 3 | **ZIP64 & Large Entry Count**: Pack/unpack archive with >1,000 files + verify external ZIP64 fixture | Clean unpack, exact entry count & hashes, ZIP64 omitted on small archives |
 | `COMPAT-06` | 2 | **WinZip AES-256 + 7z AES-256 + Unicode Password**: Pack ZIP with `단디-Pass!2026` and `.7z` with `단디-7z!2026`; unpack with `dandi` using the NFD form of each password | Exact byte recovery; wrong password returns structured `InvalidPassword`; `.7z` without password returns `PasswordRequired` and leaks no file names |
-| `COMPAT-07` | 2 | **Extended Formats & Split Volumes**: Unpack `.7z`, `.tar.gz`, `.tar.zst`, `.tar.bz2`, `.tar.xz` fixtures and RAR4/RAR5 corpus fixtures; pack PKWARE `.z01`/`.zip`, numeric `.zip.001` and `.7z.001` sets and unpack each from a middle volume; delete one volume | 100% SHA-256 match; RAR output matches libarchive ≥ 3.6 when available; `overwrite: false` honoured; Info-ZIP `zip -s 0` merges the PKWARE set when available; missing volume reported by name |
+| `COMPAT-07` | 2 | **Extended Formats & Split Volumes**: Unpack `.7z`, `.tar.gz`, `.tar.zst`, `.tar.bz2`, `.tar.xz` fixtures and RAR4/RAR5 corpus fixtures; pack PKWARE `.z01`/`.zip`, numeric `.zip.001` and `.7z.001` sets and unpack each from a middle volume; delete one volume | 100% SHA-256 match; RAR output matches libarchive `bsdtar` ≥ 3.6 when available (macOS/Linux); `overwrite: false` honoured; Info-ZIP `zip -s 0` merges the PKWARE set when available; missing volume reported by name |
 
 ---
 
