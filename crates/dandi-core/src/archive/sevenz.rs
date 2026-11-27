@@ -1,23 +1,20 @@
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sevenz_rust2::{ArchiveReader, Password};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::archive::extract_sink::ExtractionSink;
 use crate::archive::{
-    ensure_no_symlink_ancestors, plan_extract_root, synthesize_parent_dirs, ArchiveEntryInfo,
-    ArchiveFormat, ArchiveSummary, DirCleanupGuard, EntryKind, InspectOptions, UnpackOptions,
-    UnpackReport,
+    plan_extract_root, synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary,
+    EntryKind, InspectOptions, UnpackOptions, UnpackReport,
 };
 use crate::codec::{EncodingCandidate, EncodingDetection, EncodingId};
 use crate::error::{DandiError, Result};
-use crate::platform::{read_zone_identifier, set_mtime, to_fs_path, write_zone_identifier};
+use crate::platform::{read_zone_identifier, to_fs_path};
 use crate::progress::{ProgressEvent, ProgressObserver, ProgressPhase};
-use crate::safety::{is_os_junk, sanitize_entry_path, CollisionTracker};
-
-const STREAM_BUF_SIZE: usize = 256 * 1024;
+use crate::safety::{is_os_junk, sanitize_entry_path};
 
 pub(crate) fn inspect_7z(archive_path: &Path, opts: &InspectOptions) -> Result<ArchiveSummary> {
     let pw = build_7z_password(opts.password.as_deref());
@@ -153,7 +150,7 @@ pub(crate) fn unpack_7z(
         };
         budget.record_entry(file.size(), 0)?;
         let sanitized = sanitize_entry_path(&name_nfc, opts.path_policy)?;
-        visible_for_smart.push((sanitized.normalized, kind));
+        visible_for_smart.push((sanitized.normalized().to_string(), kind));
         total_bytes_planned = total_bytes_planned.saturating_add(file.size());
     }
 
@@ -165,17 +162,9 @@ pub(crate) fn unpack_7z(
         &visible_for_smart,
     )?;
 
-    fs::create_dir_all(to_fs_path(&plan.extract_root))
-        .map_err(|e| DandiError::io(&plan.extract_root, e))?;
-    let mut dir_guard = DirCleanupGuard::new(plan.cleanup_root.clone());
-
-    let mut collisions = CollisionTracker::new();
-    let mut sanitized_paths = 0usize;
-    let mut files_extracted = 0usize;
-    let mut dirs_created = 0usize;
+    let mut sink = ExtractionSink::new(plan, opts, budget, zone_data)?;
     let mut entry_idx = 0usize;
     let mut callback_err: Option<DandiError> = None;
-    let mut read_buf = vec![0u8; STREAM_BUF_SIZE];
 
     let iter_res = reader.for_each_entries(|entry, data_reader| {
         let current_idx = entry_idx;
@@ -193,10 +182,8 @@ pub(crate) fn unpack_7z(
                 .as_ref()
                 .is_some_and(|sel| !sel.contains(&current_idx));
         if skip_entry {
-            if !entry.is_directory() && entry.size() > 0 {
-                if let Err(e) =
-                    budget.record_written_bytes(entry.size(), entry.size(), archive_file_size)
-                {
+            if !entry.is_directory() {
+                if let Err(e) = sink.record_skipped_bytes(entry.size(), archive_file_size) {
                     callback_err = Some(e);
                     return Ok(false);
                 }
@@ -204,130 +191,43 @@ pub(crate) fn unpack_7z(
             return Ok(true);
         }
 
-        let sanitized = match sanitize_entry_path(&name_nfc, opts.path_policy) {
-            Ok(s) => s,
-            Err(e) => {
-                callback_err = Some(e);
-                return Ok(false);
-            }
-        };
-        if sanitized.was_sanitized {
-            sanitized_paths += 1;
-        }
-        let eff_str = match plan.strip_prefix.as_deref() {
-            Some(p) if sanitized.normalized == p => String::new(),
-            Some(p) => sanitized
-                .normalized
-                .strip_prefix(&format!("{p}/"))
-                .unwrap_or(&sanitized.normalized)
-                .to_string(),
-            None => sanitized.normalized.clone(),
-        };
-        if eff_str.is_empty() {
-            return Ok(true);
-        }
-        let eff = match sanitize_entry_path(&eff_str, opts.path_policy) {
-            Ok(s) => s,
-            Err(e) => {
-                callback_err = Some(e);
-                return Ok(false);
-            }
-        };
-
-        if entry.is_directory() {
-            collisions.register_dir(&eff.normalized);
-            let out_path = plan.extract_root.join(&eff.relative);
-            if let Err(e) = ensure_no_symlink_ancestors(&plan.extract_root, &eff.relative) {
-                callback_err = Some(e);
-                return Ok(false);
-            }
-            if let Err(e) = fs::create_dir_all(to_fs_path(&out_path)) {
-                callback_err = Some(DandiError::io(&out_path, e));
-                return Ok(false);
-            }
-            dirs_created += 1;
+        let mtime = if entry.has_last_modified_date {
+            nt_time_to_unix_secs(entry.last_modified_date())
         } else {
-            let resolved_rel = collisions.resolve_file(&eff);
-            let out_path = plan.extract_root.join(&resolved_rel);
-            if let Some(parent_rel) = resolved_rel.parent() {
-                if !parent_rel.as_os_str().is_empty() {
-                    if let Err(e) = ensure_no_symlink_ancestors(&plan.extract_root, parent_rel) {
-                        callback_err = Some(e);
-                        return Ok(false);
-                    }
-                    let parent_abs = plan.extract_root.join(parent_rel);
-                    if let Err(e) = fs::create_dir_all(to_fs_path(&parent_abs)) {
-                        callback_err = Some(DandiError::io(&parent_abs, e));
-                        return Ok(false);
-                    }
-                }
+            None
+        };
+
+        let extract_res = if entry.is_directory() {
+            sink.extract_directory(&name_nfc, mtime, None)
+        } else {
+            sink.extract_file(
+                &name_nfc,
+                data_reader,
+                archive_file_size,
+                false,
+                mtime,
+                None,
+                |e| DandiError::CorruptArchive(e.to_string()),
+            )
+        };
+
+        match extract_res {
+            Ok(Some(current_entry)) => {
+                observer.on_progress(&ProgressEvent {
+                    phase: ProgressPhase::Unpacking,
+                    current_entry,
+                    entries_done: entry_idx,
+                    entries_total: total_count,
+                    bytes_done: sink.bytes_written(),
+                    bytes_total: total_bytes_planned.max(1),
+                });
             }
-            if let Err(e) = ensure_no_symlink_ancestors(&plan.extract_root, &resolved_rel) {
+            Ok(None) => {}
+            Err(e) => {
                 callback_err = Some(e);
                 return Ok(false);
             }
-
-            let fs_out = to_fs_path(&out_path);
-            let file = match File::create(&fs_out) {
-                Ok(f) => f,
-                Err(e) => {
-                    callback_err = Some(DandiError::io(&out_path, e));
-                    return Ok(false);
-                }
-            };
-            let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, file);
-            let mut entry_written = 0u64;
-
-            loop {
-                if opts.cancel.is_cancelled() {
-                    callback_err = Some(DandiError::Cancelled);
-                    return Ok(false);
-                }
-                let n = match data_reader.read(&mut read_buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) => {
-                        callback_err = Some(DandiError::CorruptArchive(e.to_string()));
-                        return Ok(false);
-                    }
-                };
-                entry_written = entry_written.saturating_add(n as u64);
-                if let Err(e) =
-                    budget.record_written_bytes(n as u64, entry_written, archive_file_size)
-                {
-                    callback_err = Some(e);
-                    return Ok(false);
-                }
-                if let Err(e) = writer.write_all(&read_buf[..n]) {
-                    callback_err = Some(DandiError::io(&out_path, e));
-                    return Ok(false);
-                }
-            }
-            if let Err(e) = writer.flush() {
-                callback_err = Some(DandiError::io(&out_path, e));
-                return Ok(false);
-            }
-            drop(writer);
-
-            if entry.has_last_modified_date {
-                if let Some(ts) = nt_time_to_unix_secs(entry.last_modified_date()) {
-                    let _ = set_mtime(&out_path, ts, false);
-                }
-            }
-            if let Some(ref zdata) = zone_data {
-                let _ = write_zone_identifier(&out_path, zdata);
-            }
-            files_extracted += 1;
         }
-
-        observer.on_progress(&ProgressEvent {
-            phase: ProgressPhase::Unpacking,
-            current_entry: eff.normalized,
-            entries_done: entry_idx,
-            entries_total: total_count,
-            bytes_done: budget.bytes_written(),
-            bytes_total: total_bytes_planned.max(1),
-        });
 
         Ok(true)
     });
@@ -337,21 +237,12 @@ pub(crate) fn unpack_7z(
     }
     iter_res.map_err(map_7z_error)?;
 
-    dir_guard.disarm();
-
-    Ok(UnpackReport {
-        format: ArchiveFormat::SevenZ,
-        output_dir: plan.reported_output_dir,
-        detected_encoding: EncodingId::Utf8,
-        applied_encoding: EncodingId::Utf8,
-        files_extracted,
-        dirs_created,
-        symlinks_created: 0,
+    sink.finish(
+        ArchiveFormat::SevenZ,
+        EncodingId::Utf8,
+        EncodingId::Utf8,
         junk_skipped,
-        bytes_written: budget.bytes_written(),
-        sanitized_paths,
-        renamed_collisions: collisions.into_renames(),
-    })
+    )
 }
 
 fn build_7z_password(password: Option<&str>) -> Password {

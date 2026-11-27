@@ -14,7 +14,7 @@ pub mod safety;
 pub use archive::{
     detect_format, inspect, pack, repack_nfc, unpack, ArchiveEntryInfo, ArchiveFormat,
     ArchiveSummary, EntryKind, ExtractMode, InspectOptions, PackOptions, PackReport, RepackOptions,
-    RepackReport, UnpackOptions, UnpackReport,
+    RepackReport, UnpackOptions, UnpackReport, UnpackWarning,
 };
 pub use codec::{
     decode_entry_name, detect_archive_encoding, normalize_for_pack, supported_encodings,
@@ -22,6 +22,7 @@ pub use codec::{
     EntryEncodingFlags,
 };
 pub use error::{DandiError, Result};
+pub use platform::SymlinkOutcome;
 pub use progress::{
     CancellationToken, NoopProgressObserver, ProgressEvent, ProgressObserver, ProgressPhase,
     ThrottledProgressObserver,

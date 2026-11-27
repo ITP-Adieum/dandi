@@ -14,6 +14,7 @@ pub enum ErrorKind {
     UnsafeSymlink,
     BudgetExceeded,
     Cancelled,
+    AlreadyExists,
     InvalidInput,
     UnsupportedEncoding,
     ArchiveEngine,
@@ -56,6 +57,7 @@ impl From<DandiError> for CommandError {
             DandiError::UnsafeSymlink { .. } => ErrorKind::UnsafeSymlink,
             DandiError::BudgetExceeded { .. } => ErrorKind::BudgetExceeded,
             DandiError::Cancelled => ErrorKind::Cancelled,
+            DandiError::AlreadyExists { .. } => ErrorKind::AlreadyExists,
             DandiError::InvalidInput(_) => ErrorKind::InvalidInput,
             DandiError::UnsupportedEncoding(_) => ErrorKind::UnsupportedEncoding,
             DandiError::ArchiveEngine(_) => ErrorKind::ArchiveEngine,
@@ -110,6 +112,12 @@ mod tests {
                 ErrorKind::BudgetExceeded,
             ),
             (DandiError::Cancelled, ErrorKind::Cancelled),
+            (
+                DandiError::AlreadyExists {
+                    path: std::path::PathBuf::from("existing.txt"),
+                },
+                ErrorKind::AlreadyExists,
+            ),
             (
                 DandiError::InvalidInput("empty".into()),
                 ErrorKind::InvalidInput,

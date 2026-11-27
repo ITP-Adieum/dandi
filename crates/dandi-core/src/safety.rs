@@ -27,14 +27,48 @@ impl PathPolicy {
 }
 
 /// Sanitized relative path ready for safe extraction inside a target directory.
+///
+/// All fields are private so instances can only be constructed through [`sanitize_entry_path`]
+/// or deterministic collision disambiguation inside [`CollisionTracker`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SanitizedPath {
     /// Clean relative path using POSIX `/` separators.
-    pub normalized: String,
+    normalized: String,
     /// Native relative `PathBuf` built from sanitized path components.
-    pub relative: PathBuf,
+    relative: PathBuf,
     /// True if any segment was modified by Windows-compatibility sanitization.
-    pub was_sanitized: bool,
+    was_sanitized: bool,
+}
+
+impl SanitizedPath {
+    /// Clean relative path using POSIX `/` separators.
+    pub fn normalized(&self) -> &str {
+        &self.normalized
+    }
+
+    /// Native relative `Path` built from sanitized path components.
+    pub fn relative(&self) -> &Path {
+        &self.relative
+    }
+
+    /// True if any segment was modified by Windows-compatibility sanitization.
+    pub fn was_sanitized(&self) -> bool {
+        self.was_sanitized
+    }
+
+    /// Internal constructor used by `CollisionTracker` for deterministic suffix renames
+    /// derived from an already-validated `SanitizedPath`.
+    fn from_collision_rename(normalized: String, was_sanitized: bool) -> Self {
+        let mut relative = PathBuf::new();
+        for seg in normalized.split('/') {
+            relative.push(seg);
+        }
+        Self {
+            normalized,
+            relative,
+            was_sanitized,
+        }
+    }
 }
 
 /// Records a case-insensitive filename collision that was deterministically disambiguated.
@@ -361,14 +395,14 @@ impl CollisionTracker {
 
     /// Resolves a file or symlink path, deterministically suffixing colliding names (`name (2).ext`),
     /// including case-insensitive collisions with already-registered directories.
-    pub fn resolve_file(&mut self, sanitized: &SanitizedPath) -> PathBuf {
+    pub fn resolve_file(&mut self, sanitized: &SanitizedPath) -> SanitizedPath {
         if let Some((parent, _)) = sanitized.normalized.rsplit_once('/') {
             self.register_dir(parent);
         }
         let lower = sanitized.normalized.to_lowercase();
         if !self.seen_files.contains(&lower) && !self.seen_dirs.contains(&lower) {
             self.seen_files.insert(lower);
-            return sanitized.relative.clone();
+            return sanitized.clone();
         }
 
         let (dir_prefix, file_name) = match sanitized.normalized.rsplit_once('/') {
@@ -396,11 +430,10 @@ impl CollisionTracker {
                     original: sanitized.normalized.clone(),
                     resolved: candidate_norm.clone(),
                 });
-                let mut rel = PathBuf::new();
-                for seg in candidate_norm.split('/') {
-                    rel.push(seg);
-                }
-                return rel;
+                return SanitizedPath::from_collision_rename(
+                    candidate_norm,
+                    sanitized.was_sanitized,
+                );
             }
             counter += 1;
         }
@@ -661,20 +694,20 @@ mod tests {
     #[test]
     fn sanitizes_windows_hazards() {
         let s1 = sanitize_entry_path("a:b*c?.txt", PathPolicy::WindowsCompat).unwrap();
-        assert_eq!(s1.normalized, "a_b_c_.txt");
-        assert!(s1.was_sanitized);
+        assert_eq!(s1.normalized(), "a_b_c_.txt");
+        assert!(s1.was_sanitized());
 
         let s2 = sanitize_entry_path("CON.txt", PathPolicy::WindowsCompat).unwrap();
-        assert_eq!(s2.normalized, "_CON.txt");
+        assert_eq!(s2.normalized(), "_CON.txt");
 
         let s3 = sanitize_entry_path("dir/NUL", PathPolicy::WindowsCompat).unwrap();
-        assert_eq!(s3.normalized, "dir/_NUL");
+        assert_eq!(s3.normalized(), "dir/_NUL");
 
         let s4 = sanitize_entry_path("trailing. ", PathPolicy::WindowsCompat).unwrap();
-        assert_eq!(s4.normalized, "trailing");
+        assert_eq!(s4.normalized(), "trailing");
 
         let s5 = sanitize_entry_path("CON .txt", PathPolicy::WindowsCompat).unwrap();
-        assert_eq!(s5.normalized, "_CON .txt");
+        assert_eq!(s5.normalized(), "_CON .txt");
     }
 
     #[test]
@@ -710,14 +743,17 @@ mod tests {
         let mut tracker = CollisionTracker::new();
         let a = sanitize_entry_path("docs/Readme.md", PathPolicy::WindowsCompat).unwrap();
         let b = sanitize_entry_path("docs/README.md", PathPolicy::WindowsCompat).unwrap();
-        assert_eq!(tracker.resolve_file(&a), PathBuf::from("docs/Readme.md"));
         assert_eq!(
-            tracker.resolve_file(&b),
-            PathBuf::from("docs/README (2).md")
+            tracker.resolve_file(&a).relative(),
+            Path::new("docs/Readme.md")
+        );
+        assert_eq!(
+            tracker.resolve_file(&b).relative(),
+            Path::new("docs/README (2).md")
         );
         // File colliding case-insensitively with existing directory `docs`
         let c = sanitize_entry_path("DOCS", PathPolicy::WindowsCompat).unwrap();
-        assert_eq!(tracker.resolve_file(&c), PathBuf::from("DOCS (2)"));
+        assert_eq!(tracker.resolve_file(&c).relative(), Path::new("DOCS (2)"));
         assert_eq!(tracker.into_renames().len(), 2);
     }
 

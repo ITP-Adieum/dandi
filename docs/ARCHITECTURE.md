@@ -18,10 +18,11 @@ dandi/
 │   │       ├── safety.rs       # Deep Module 2: Zip Slip, symlinks, Win paths, collisions, Zip Bomb
 │   │       ├── archive/        # Deep Module 3: Unified inspect / pack / unpack / repack_nfc
 │   │       │   ├── mod.rs      # Public ArchiveEngine interface + SmartExtract planner
+│   │       │   ├── extract_sink.rs # Unified disk-write sink (ZIP/TAR/7z): safety, atomic overwrite, warnings, rollback
 │   │       │   ├── format.rs   # Magic-byte + extension format detection
-│   │       │   ├── zip_io.rs   # High-speed parallel Deflate + Store + ZIP64 + 0x5455 + AES-256
-│   │       │   ├── sevenz.rs   # 7z reader (sevenz-rust2)
-│   │       │   └── tar_io.rs   # tar / tar.gz / tar.zst / tar.bz2 / tar.xz reader
+│   │       │   ├── zip/        # Modular ZIP engine (header.rs, writer.rs, reader.rs, mod.rs)
+│   │       │   ├── sevenz.rs   # 7z reader (sevenz-rust2 -> ExtractionSink)
+│   │       │   └── tar_io.rs   # tar / tar.gz / tar.zst / tar.bz2 / tar.xz reader (-> ExtractionSink)
 │   │       ├── progress.rs     # Cooperative CancellationToken + ProgressEvent sink
 │   │       └── platform.rs     # OS-specific adapters (Unix perms/symlinks, Windows \\?\ & Zone.ID)
 │   ├── dandi-cli/              # Thin CLI adapter (clap) -> calls dandi-core only

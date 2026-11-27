@@ -8,48 +8,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
+use time::OffsetDateTime;
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::archive::{
-    check_not_through_archive_symlink, check_symlink_chain_safe, ensure_no_symlink_ancestors,
-    plan_extract_root, synthesize_parent_dirs, ArchiveEntryInfo, ArchiveFormat, ArchiveSummary,
-    DirCleanupGuard, EntryKind, InspectOptions, PackOptions, PackReport, RepackOptions,
-    RepackReport, UnpackOptions, UnpackReport,
+use crate::archive::zip::header::{
+    build_0x5455_extra, read_zip_raw_entries, unix_secs_to_dos, BIT11_UTF8, CDH_SIG, EOCD_SIG,
+    LFH_SIG, METHOD_DEFLATE, METHOD_STORE, VERSION_MADE_BY_UNIX, ZIP64_EOCD_SIG, ZIP64_LOCATOR_SIG,
+    ZIP64_THRESHOLD_ENTRIES, ZIP64_THRESHOLD_U32,
 };
+use crate::archive::zip::reader::{classify_zip_read_io_error, map_zip_error, open_zip_entry};
+use crate::archive::{EntryKind, PackOptions, PackReport, RepackOptions, RepackReport};
 use crate::codec::{
-    decode_entry_name_with_override, detect_archive_encoding, normalize_for_pack, verify_0x7075,
+    decode_entry_name_with_override, detect_archive_encoding, normalize_for_pack,
     EntryEncodingFlags,
 };
 use crate::error::{DandiError, Result};
-use crate::platform::{
-    apply_unix_mode, create_relative_symlink, read_unix_mode_for_pack, read_zone_identifier,
-    set_mtime, to_fs_path, write_zone_identifier,
-};
+use crate::platform::{read_unix_mode_for_pack, to_fs_path};
 use crate::progress::{ProgressEvent, ProgressObserver, ProgressPhase};
-use crate::safety::{
-    is_os_junk, sanitize_entry_path, validate_symlink_target, CollisionTracker, SafetyBudget,
-};
-
-const LFH_SIG: u32 = 0x0403_4b50;
-const CDH_SIG: u32 = 0x0201_4b50;
-const EOCD_SIG: u32 = 0x0605_4b50;
-const ZIP64_EOCD_SIG: u32 = 0x0606_4b50;
-const ZIP64_LOCATOR_SIG: u32 = 0x0706_4b50;
-
-const BIT11_UTF8: u16 = 0x0800;
-const BIT0_ENCRYPTED: u16 = 0x0001;
-const VERSION_MADE_BY_UNIX: u16 = 3 << 8;
-
-const METHOD_STORE: u16 = 0;
-const METHOD_DEFLATE: u16 = 8;
-
-const ZIP64_THRESHOLD_U32: u64 = 0xFFFF_FFFF;
-const ZIP64_THRESHOLD_ENTRIES: usize = 0xFFFF;
+use crate::safety::is_os_junk;
 
 const PARALLEL_BATCH_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const PARALLEL_BATCH_MAX_FILES: usize = 256;
@@ -57,482 +36,6 @@ const LARGE_STREAM_THRESHOLD: u64 = 16 * 1024 * 1024;
 const STREAM_BUF_SIZE: usize = 256 * 1024;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Raw parsed Central Directory entry header for low-level inspection and accurate encoding detection.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RawZipEntryHeader {
-    pub index: usize,
-    pub version_made_by: u16,
-    pub version_needed: u16,
-    pub flags: u16,
-    pub compression_method: u16,
-    pub dos_time: u16,
-    pub dos_date: u16,
-    pub crc32: u32,
-    pub compressed_size: u64,
-    pub uncompressed_size: u64,
-    pub raw_name: Vec<u8>,
-    pub extra_data: Vec<u8>,
-    pub external_attrs: u32,
-    pub local_header_offset: u64,
-    pub has_0x7075: bool,
-    pub has_0x5455: bool,
-    pub has_zip64_extra: bool,
-    pub mtime_unix_secs: Option<i64>,
-}
-
-impl RawZipEntryHeader {
-    pub fn utf8_bit11(&self) -> bool {
-        (self.flags & BIT11_UTF8) != 0
-    }
-
-    pub fn encrypted(&self) -> bool {
-        (self.flags & BIT0_ENCRYPTED) != 0
-    }
-
-    pub fn unix_mode(&self) -> Option<u32> {
-        let os_made_by = self.version_made_by >> 8;
-        if os_made_by == 3 || os_made_by == 19 {
-            let mode = (self.external_attrs >> 16) & 0xFFFF;
-            if mode != 0 {
-                return Some(mode);
-            }
-        }
-        None
-    }
-
-    pub fn is_symlink(&self) -> bool {
-        self.unix_mode()
-            .map(|m| (m & 0o170000) == 0o120000)
-            .unwrap_or(false)
-    }
-
-    /// Determines whether this ZIP entry represents a directory using the *decoded* filename.
-    ///
-    /// Never checks `raw_name.ends_with(b"\\")` on undecoded bytes because Shift_JIS characters
-    /// such as `表`, `能`, and `ソ` legitimately end with trail byte `0x5C`.
-    pub fn is_dir_with_decoded_name(&self, decoded_path: &str) -> bool {
-        if self.is_symlink() {
-            return false;
-        }
-        if decoded_path.ends_with('/') || decoded_path.ends_with('\\') {
-            return true;
-        }
-        if let Some(m) = self.unix_mode() {
-            if (m & 0o170000) == 0o040000 {
-                return true;
-            }
-        }
-        (self.external_attrs & 0x10) != 0 && self.uncompressed_size == 0
-    }
-
-    pub fn unicode_extra_0x7075(&self) -> Option<&[u8]> {
-        find_extra_field(&self.extra_data, 0x7075)
-    }
-
-    /// Returns true only when an Info-ZIP `0x7075` extra field is present AND its CRC32 matches `raw_name`.
-    pub fn has_valid_0x7075(&self) -> bool {
-        self.unicode_extra_0x7075()
-            .and_then(|e| verify_0x7075(&self.raw_name, e))
-            .is_some()
-    }
-}
-
-/// Inspects raw Central Directory headers of a ZIP file without modifying or decoding entry names.
-pub fn inspect_zip_raw_headers(path: &Path) -> Result<Vec<RawZipEntryHeader>> {
-    let fs_path = to_fs_path(path);
-    let mut file = File::open(&fs_path).map_err(|e| DandiError::io(path, e))?;
-    read_zip_raw_entries(&mut file, SafetyBudget::default().max_entries)
-}
-
-pub(crate) fn read_zip_raw_entries<R: Read + Seek>(
-    reader: &mut R,
-    max_entries: usize,
-) -> Result<Vec<RawZipEntryHeader>> {
-    let file_len = reader.seek(SeekFrom::End(0))?;
-    if file_len < 22 {
-        return Err(DandiError::CorruptArchive(
-            "file is too small to be a valid ZIP archive".to_string(),
-        ));
-    }
-
-    let search_len = file_len.min(65_535 + 22) as usize;
-    let search_start = file_len - (search_len as u64);
-    reader.seek(SeekFrom::Start(search_start))?;
-    let mut tail = vec![0u8; search_len];
-    reader.read_exact(&mut tail)?;
-
-    let eocd_rel = find_eocd(&tail).ok_or_else(|| {
-        DandiError::CorruptArchive("End of Central Directory record not found".to_string())
-    })?;
-    let eocd_offset = search_start + (eocd_rel as u64);
-    let eocd = &tail[eocd_rel..];
-
-    let mut total_entries = read_u16_le(eocd, 10)? as u64;
-    let mut cd_size = read_u32_le(eocd, 12)? as u64;
-    let mut cd_offset = read_u32_le(eocd, 16)? as u64;
-
-    // Check for ZIP64 EOCD Locator immediately preceding EOCD.
-    if eocd_offset >= 20 {
-        let mut loc = [0u8; 20];
-        reader.seek(SeekFrom::Start(eocd_offset - 20))?;
-        reader.read_exact(&mut loc)?;
-        if read_u32_le(&loc, 0)? == ZIP64_LOCATOR_SIG {
-            let z64_offset = read_u64_le(&loc, 8)?;
-            if z64_offset
-                .checked_add(56)
-                .is_some_and(|end| end <= file_len)
-            {
-                let mut z64 = [0u8; 56];
-                reader.seek(SeekFrom::Start(z64_offset))?;
-                reader.read_exact(&mut z64)?;
-                if read_u32_le(&z64, 0)? == ZIP64_EOCD_SIG {
-                    total_entries = read_u64_le(&z64, 32)?;
-                    cd_size = read_u64_le(&z64, 40)?;
-                    cd_offset = read_u64_le(&z64, 48)?;
-                }
-            }
-        }
-    }
-
-    if total_entries > max_entries as u64 {
-        return Err(DandiError::BudgetExceeded {
-            reason: format!("ZIP declares {total_entries} entries, exceeding limit {max_entries}"),
-        });
-    }
-
-    const MAX_CD_BYTES: u64 = 256 * 1024 * 1024;
-    if cd_size > MAX_CD_BYTES {
-        return Err(DandiError::CorruptArchive(format!(
-            "Central Directory size {cd_size} exceeds safety cap"
-        )));
-    }
-
-    let cd_end = cd_offset.checked_add(cd_size).ok_or_else(|| {
-        DandiError::CorruptArchive("Central Directory offset overflow".to_string())
-    })?;
-    if cd_end > file_len {
-        return Err(DandiError::CorruptArchive(
-            "Central Directory extends past end of file (truncated ZIP)".to_string(),
-        ));
-    }
-
-    reader.seek(SeekFrom::Start(cd_offset))?;
-    let mut cd_buf = vec![0u8; cd_size as usize];
-    reader.read_exact(&mut cd_buf)?;
-
-    let mut headers = Vec::with_capacity((total_entries as usize).min(4096));
-    let mut pos = 0usize;
-    let mut index = 0usize;
-
-    while pos < cd_buf.len() {
-        if pos + 46 > cd_buf.len() {
-            return Err(DandiError::CorruptArchive(
-                "truncated Central Directory entry header".to_string(),
-            ));
-        }
-        if read_u32_le(&cd_buf, pos)? != CDH_SIG {
-            return Err(DandiError::CorruptArchive(
-                "invalid Central Directory header signature".to_string(),
-            ));
-        }
-
-        let version_made_by = read_u16_le(&cd_buf, pos + 4)?;
-        let version_needed = read_u16_le(&cd_buf, pos + 6)?;
-        let flags = read_u16_le(&cd_buf, pos + 8)?;
-        let compression_method = read_u16_le(&cd_buf, pos + 10)?;
-        let dos_time = read_u16_le(&cd_buf, pos + 12)?;
-        let dos_date = read_u16_le(&cd_buf, pos + 14)?;
-        let crc32 = read_u32_le(&cd_buf, pos + 16)?;
-        let mut compressed_size = read_u32_le(&cd_buf, pos + 20)? as u64;
-        let mut uncompressed_size = read_u32_le(&cd_buf, pos + 24)? as u64;
-        let name_len = read_u16_le(&cd_buf, pos + 28)? as usize;
-        let extra_len = read_u16_le(&cd_buf, pos + 30)? as usize;
-        let comment_len = read_u16_le(&cd_buf, pos + 32)? as usize;
-        let external_attrs = read_u32_le(&cd_buf, pos + 38)?;
-        let mut local_header_offset = read_u32_le(&cd_buf, pos + 42)? as u64;
-
-        let name_start = pos + 46;
-        let extra_start = name_start + name_len;
-        let comment_start = extra_start + extra_len;
-        let next_pos = comment_start + comment_len;
-        if next_pos > cd_buf.len() {
-            return Err(DandiError::CorruptArchive(
-                "Central Directory variable field out of bounds".to_string(),
-            ));
-        }
-
-        let raw_name = cd_buf[name_start..extra_start].to_vec();
-        let extra_data = cd_buf[extra_start..comment_start].to_vec();
-
-        let has_zip64_extra = if let Some(z64_field) = find_extra_field(&extra_data, 0x0001) {
-            let mut zpos = 0usize;
-            if uncompressed_size == ZIP64_THRESHOLD_U32 && zpos + 8 <= z64_field.len() {
-                uncompressed_size = read_u64_le(z64_field, zpos)?;
-                zpos += 8;
-            }
-            if compressed_size == ZIP64_THRESHOLD_U32 && zpos + 8 <= z64_field.len() {
-                compressed_size = read_u64_le(z64_field, zpos)?;
-                zpos += 8;
-            }
-            if local_header_offset == ZIP64_THRESHOLD_U32 && zpos + 8 <= z64_field.len() {
-                local_header_offset = read_u64_le(z64_field, zpos)?;
-            }
-            true
-        } else {
-            false
-        };
-
-        let has_0x7075 = find_extra_field(&extra_data, 0x7075).is_some();
-        let mtime_5455 = parse_0x5455_mtime(&extra_data);
-        let has_0x5455 = mtime_5455.is_some();
-        let mtime_unix_secs = mtime_5455
-            .or_else(|| parse_0x000a_mtime(&extra_data))
-            .or_else(|| dos_to_unix_secs(dos_date, dos_time));
-
-        headers.push(RawZipEntryHeader {
-            index,
-            version_made_by,
-            version_needed,
-            flags,
-            compression_method,
-            dos_time,
-            dos_date,
-            crc32,
-            compressed_size,
-            uncompressed_size,
-            raw_name,
-            extra_data,
-            external_attrs,
-            local_header_offset,
-            has_0x7075,
-            has_0x5455,
-            has_zip64_extra,
-            mtime_unix_secs,
-        });
-
-        pos = next_pos;
-        index += 1;
-        if index > max_entries {
-            return Err(DandiError::BudgetExceeded {
-                reason: format!("ZIP entry count exceeds limit {max_entries}"),
-            });
-        }
-    }
-
-    Ok(headers)
-}
-
-fn find_eocd(tail: &[u8]) -> Option<usize> {
-    if tail.len() < 22 {
-        return None;
-    }
-    let max_start = tail.len() - 22;
-    for pos in (0..=max_start).rev() {
-        if tail[pos..pos + 4] == EOCD_SIG.to_le_bytes() {
-            let comment_len = u16::from_le_bytes([tail[pos + 20], tail[pos + 21]]) as usize;
-            if pos + 22 + comment_len == tail.len() {
-                return Some(pos);
-            }
-        }
-    }
-    None
-}
-
-fn find_extra_field(extra: &[u8], target_id: u16) -> Option<&[u8]> {
-    let mut pos = 0usize;
-    while pos + 4 <= extra.len() {
-        let id = u16::from_le_bytes([extra[pos], extra[pos + 1]]);
-        let len = u16::from_le_bytes([extra[pos + 2], extra[pos + 3]]) as usize;
-        let data_start = pos + 4;
-        let data_end = data_start + len;
-        if data_end > extra.len() {
-            break;
-        }
-        if id == target_id {
-            return Some(&extra[data_start..data_end]);
-        }
-        pos = data_end;
-    }
-    None
-}
-
-fn parse_0x5455_mtime(extra: &[u8]) -> Option<i64> {
-    let data = find_extra_field(extra, 0x5455)?;
-    if data.len() >= 5 && (data[0] & 0x01) != 0 {
-        let ts = i32::from_le_bytes([data[1], data[2], data[3], data[4]]) as i64;
-        return Some(ts);
-    }
-    None
-}
-
-fn parse_0x000a_mtime(extra: &[u8]) -> Option<i64> {
-    let data = find_extra_field(extra, 0x000a)?;
-    if data.len() < 4 {
-        return None;
-    }
-    let mut pos = 4; // skip 4-byte reserved field
-    while pos + 4 <= data.len() {
-        let tag = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        let size = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
-        let start = pos + 4;
-        let end = start + size;
-        if end > data.len() {
-            break;
-        }
-        if tag == 0x0001 && size >= 8 {
-            let ntfs_ticks = u64::from_le_bytes([
-                data[start],
-                data[start + 1],
-                data[start + 2],
-                data[start + 3],
-                data[start + 4],
-                data[start + 5],
-                data[start + 6],
-                data[start + 7],
-            ]);
-            // NTFS epoch is 1601-01-01; Unix epoch is 1970-01-01 = 11_644_473_600 seconds later.
-            const NTFS_TO_UNIX_SECS: i64 = 11_644_473_600;
-            let secs = (ntfs_ticks / 10_000_000) as i64 - NTFS_TO_UNIX_SECS;
-            return Some(secs);
-        }
-        pos = end;
-    }
-    None
-}
-
-fn dos_to_unix_secs(dos_date: u16, dos_time: u16) -> Option<i64> {
-    if dos_date == 0 && dos_time == 0 {
-        return None;
-    }
-    let year = ((dos_date >> 9) & 0x7F) as i32 + 1980;
-    let month_num = ((dos_date >> 5) & 0x0F) as u8;
-    let day = (dos_date & 0x1F) as u8;
-    let hour = ((dos_time >> 11) & 0x1F) as u8;
-    let minute = ((dos_time >> 5) & 0x3F) as u8;
-    let second = ((dos_time & 0x1F) * 2).min(59) as u8;
-
-    let month = Month::try_from(month_num).ok()?;
-    let date = Date::from_calendar_date(year, month, day).ok()?;
-    let time = Time::from_hms(hour, minute, second).ok()?;
-    let dt = PrimitiveDateTime::new(date, time).assume_utc();
-    Some(dt.unix_timestamp())
-}
-
-fn unix_secs_to_dos(unix_secs: i64) -> (u16, u16) {
-    let dt = OffsetDateTime::from_unix_timestamp(unix_secs).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    let year = dt.year().clamp(1980, 2107);
-    let month = u8::from(dt.month()) as u16;
-    let day = dt.day() as u16;
-    let hour = dt.hour() as u16;
-    let minute = dt.minute() as u16;
-    let second = dt.second() as u16;
-
-    let dos_date = (((year - 1980) as u16) << 9) | (month << 5) | day;
-    let dos_time = (hour << 11) | (minute << 5) | (second / 2);
-    (dos_date, dos_time)
-}
-
-fn build_0x5455_extra(unix_secs: i64) -> [u8; 9] {
-    let mut buf = [0u8; 9];
-    buf[0..2].copy_from_slice(&0x5455u16.to_le_bytes());
-    buf[2..4].copy_from_slice(&5u16.to_le_bytes());
-    buf[4] = 0x01; // mtime present
-    let ts = unix_secs.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    buf[5..9].copy_from_slice(&ts.to_le_bytes());
-    buf
-}
-
-fn compression_method_name(method: u16) -> String {
-    match method {
-        0 => "store".to_string(),
-        8 => "deflate".to_string(),
-        9 => "deflate64".to_string(),
-        12 => "bzip2".to_string(),
-        14 => "lzma".to_string(),
-        93 => "zstd".to_string(),
-        98 => "ppmd".to_string(),
-        99 => "aes".to_string(),
-        other => format!("method_{other}"),
-    }
-}
-
-pub(crate) fn inspect_zip(archive_path: &Path, opts: &InspectOptions) -> Result<ArchiveSummary> {
-    let fs_path = to_fs_path(archive_path);
-    let mut file = File::open(&fs_path).map_err(|e| DandiError::io(archive_path, e))?;
-    let raw_headers = read_zip_raw_entries(&mut file, opts.budget.max_entries)?;
-
-    let non_bit11_names: Vec<&[u8]> = raw_headers
-        .iter()
-        .filter(|h| !h.utf8_bit11() && !h.has_valid_0x7075())
-        .map(|h| h.raw_name.as_slice())
-        .collect();
-    let detection = detect_archive_encoding(&non_bit11_names, opts.locale_hint);
-    let applied_encoding = opts.encoding_override.unwrap_or(detection.encoding);
-    let explicit_override = opts.encoding_override.is_some();
-
-    let mut entries = Vec::with_capacity(raw_headers.len());
-    let mut total_uncompressed = 0u64;
-    let mut total_compressed = 0u64;
-    let mut any_encrypted = false;
-
-    for h in &raw_headers {
-        let decoded = decode_entry_name_with_override(
-            &h.raw_name,
-            EntryEncodingFlags {
-                utf8_bit11: h.utf8_bit11(),
-            },
-            h.unicode_extra_0x7075(),
-            applied_encoding,
-            explicit_override,
-        );
-        let junk = is_os_junk(&decoded.path);
-        if junk && !opts.include_os_junk {
-            continue;
-        }
-        let kind = if h.is_symlink() {
-            EntryKind::Symlink
-        } else if h.is_dir_with_decoded_name(&decoded.path) {
-            EntryKind::Directory
-        } else {
-            EntryKind::File
-        };
-        if h.encrypted() {
-            any_encrypted = true;
-        }
-        total_uncompressed = total_uncompressed.saturating_add(h.uncompressed_size);
-        total_compressed = total_compressed.saturating_add(h.compressed_size);
-
-        entries.push(ArchiveEntryInfo {
-            index: Some(h.index),
-            path: decoded.path,
-            kind,
-            uncompressed_size: h.uncompressed_size,
-            compressed_size: h.compressed_size,
-            modified_unix_secs: h.mtime_unix_secs,
-            unix_mode: h.unix_mode(),
-            encrypted: h.encrypted(),
-            compression_method: compression_method_name(h.compression_method),
-            is_os_junk: junk,
-            is_synthesized: false,
-            symlink_target: None,
-        });
-    }
-
-    let entries = synthesize_parent_dirs(entries);
-    let total_entries = entries.len();
-
-    Ok(ArchiveSummary {
-        format: ArchiveFormat::Zip,
-        encoding: detection,
-        applied_encoding,
-        total_entries,
-        total_uncompressed_bytes: total_uncompressed,
-        total_compressed_bytes: total_compressed,
-        encrypted: any_encrypted,
-        entries,
-    })
-}
 
 /// Checks if a filename extension belongs to an already-compressed format suitable for Method 0 Store.
 pub(crate) fn is_incompressible_extension(path: &str) -> bool {
@@ -631,10 +134,9 @@ fn commit_temp_file(tmp: &Path, dst: &Path, overwrite: bool) -> Result<()> {
     let fs_dst = to_fs_path(dst);
     if fs_dst.exists() {
         if !overwrite {
-            return Err(DandiError::InvalidInput(format!(
-                "destination already exists: {}",
-                dst.display()
-            )));
+            return Err(DandiError::AlreadyExists {
+                path: dst.to_path_buf(),
+            });
         }
         #[cfg(windows)]
         {
@@ -833,10 +335,9 @@ pub(crate) fn pack_zip(
 ) -> Result<PackReport> {
     opts.cancel.check()?;
     if to_fs_path(output_zip).exists() && !opts.overwrite {
-        return Err(DandiError::InvalidInput(format!(
-            "output archive already exists: {}",
-            output_zip.display()
-        )));
+        return Err(DandiError::AlreadyExists {
+            path: output_zip.to_path_buf(),
+        });
     }
 
     if let Some(parent) = output_zip.parent() {
@@ -952,6 +453,9 @@ impl GoldenZipWriter {
 
     fn write_prepared(&mut self, entry: PreparedEntry) -> Result<()> {
         let name_bytes = entry.archive_name.into_bytes();
+        let name_len = u16::try_from(name_bytes.len()).map_err(|_| {
+            DandiError::InvalidInput("ZIP entry filename exceeds 65535 bytes".to_string())
+        })?;
         let compressed_size = entry.payload.len() as u64;
         let uncompressed_size = entry.uncompressed_size;
         let local_header_offset = self.offset;
@@ -999,7 +503,7 @@ impl GoldenZipWriter {
         lfh[14..18].copy_from_slice(&entry.crc32.to_le_bytes());
         lfh[18..22].copy_from_slice(&lfh_comp.to_le_bytes());
         lfh[22..26].copy_from_slice(&lfh_uncomp.to_le_bytes());
-        lfh[26..28].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        lfh[26..28].copy_from_slice(&name_len.to_le_bytes());
         lfh[28..30].copy_from_slice(&(lfh_extra.len() as u16).to_le_bytes());
 
         self.write_all_tracked(&lfh)?;
@@ -1040,6 +544,9 @@ impl GoldenZipWriter {
             METHOD_DEFLATE
         };
         let name_bytes = item.archive_name.as_bytes().to_vec();
+        let name_len = u16::try_from(name_bytes.len()).map_err(|_| {
+            DandiError::InvalidInput("ZIP entry filename exceeds 65535 bytes".to_string())
+        })?;
         let local_header_offset = self.offset;
         let need_zip64_sizes = item.size >= ZIP64_THRESHOLD_U32;
         let need_zip64_offset = local_header_offset >= ZIP64_THRESHOLD_U32;
@@ -1069,7 +576,7 @@ impl GoldenZipWriter {
         lfh[8..10].copy_from_slice(&method.to_le_bytes());
         lfh[10..12].copy_from_slice(&dos_time.to_le_bytes());
         lfh[12..14].copy_from_slice(&dos_date.to_le_bytes());
-        lfh[26..28].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        lfh[26..28].copy_from_slice(&name_len.to_le_bytes());
         lfh[28..30].copy_from_slice(&(lfh_extra.len() as u16).to_le_bytes());
 
         self.write_all_tracked(&lfh)?;
@@ -1657,420 +1164,6 @@ fn unix_secs_to_zip_datetime(unix_secs: i64) -> zip::DateTime {
     zip::DateTime::from_date_and_time(year, month, day, hour, minute, second).unwrap_or_default()
 }
 
-pub(crate) fn unpack_zip(
-    archive_path: &Path,
-    dest_dir: &Path,
-    opts: &UnpackOptions,
-    observer: &dyn ProgressObserver,
-) -> Result<UnpackReport> {
-    opts.cancel.check()?;
-    let fs_archive = to_fs_path(archive_path);
-    let archive_file_size = fs::metadata(&fs_archive)
-        .map(|m| m.len())
-        .unwrap_or(1)
-        .max(1);
-    let mut raw_file = File::open(&fs_archive).map_err(|e| DandiError::io(archive_path, e))?;
-    let raw_headers = read_zip_raw_entries(&mut raw_file, opts.budget.max_entries)?;
-
-    let non_bit11_names: Vec<&[u8]> = raw_headers
-        .iter()
-        .filter(|h| !h.utf8_bit11() && !h.has_valid_0x7075())
-        .map(|h| h.raw_name.as_slice())
-        .collect();
-    let detection = detect_archive_encoding(&non_bit11_names, opts.locale_hint);
-    let applied_encoding = opts.encoding_override.unwrap_or(detection.encoding);
-    let explicit_override = opts.encoding_override.is_some();
-
-    let zone_data = if opts.propagate_zone_identifier {
-        read_zone_identifier(archive_path)
-    } else {
-        None
-    };
-
-    // Decode all entry names & build plan before touching disk.
-    struct PlannedZipEntry {
-        index: usize,
-        decoded_path: String,
-        kind: EntryKind,
-        compressed_size: u64,
-        uncompressed_size: u64,
-        mtime_unix_secs: Option<i64>,
-        unix_mode: Option<u32>,
-        encrypted: bool,
-    }
-
-    let mut planned = Vec::with_capacity(raw_headers.len());
-    let mut junk_skipped = 0usize;
-    let mut visible_for_smart: Vec<(String, EntryKind)> = Vec::new();
-    let mut budget = opts.budget.clone();
-    budget.set_archive_compressed_size(archive_file_size);
-
-    for h in &raw_headers {
-        opts.cancel.check()?;
-        let decoded = decode_entry_name_with_override(
-            &h.raw_name,
-            EntryEncodingFlags {
-                utf8_bit11: h.utf8_bit11(),
-            },
-            h.unicode_extra_0x7075(),
-            applied_encoding,
-            explicit_override,
-        );
-        let junk = is_os_junk(&decoded.path);
-        if opts.exclude_os_junk && junk {
-            junk_skipped += 1;
-            continue;
-        }
-        if let Some(ref sel) = opts.selected_entries {
-            if !sel.contains(&h.index) {
-                continue;
-            }
-        }
-
-        let kind = if h.is_symlink() {
-            EntryKind::Symlink
-        } else if h.is_dir_with_decoded_name(&decoded.path) {
-            EntryKind::Directory
-        } else {
-            EntryKind::File
-        };
-
-        // Validate every entry path and budget up front before writing anything to disk.
-        budget.record_entry(h.uncompressed_size, h.compressed_size)?;
-        let sanitized = sanitize_entry_path(&decoded.path, opts.path_policy)?;
-        visible_for_smart.push((sanitized.normalized, kind));
-
-        planned.push(PlannedZipEntry {
-            index: h.index,
-            decoded_path: decoded.path,
-            kind,
-            compressed_size: h.compressed_size,
-            uncompressed_size: h.uncompressed_size,
-            mtime_unix_secs: h.mtime_unix_secs,
-            unix_mode: h.unix_mode(),
-            encrypted: h.encrypted(),
-        });
-    }
-
-    let plan = plan_extract_root(
-        archive_path,
-        dest_dir,
-        opts.mode,
-        opts.overwrite,
-        &visible_for_smart,
-    )?;
-
-    fs::create_dir_all(to_fs_path(&plan.extract_root))
-        .map_err(|e| DandiError::io(&plan.extract_root, e))?;
-    let mut dir_guard = DirCleanupGuard::new(plan.cleanup_root.clone());
-
-    raw_file.seek(SeekFrom::Start(0))?;
-    let mut archive = ZipArchive::new(BufReader::with_capacity(STREAM_BUF_SIZE, raw_file))
-        .map_err(map_zip_error)?;
-
-    let mut collisions = CollisionTracker::new();
-    let mut sanitized_paths = 0usize;
-    let mut files_extracted = 0usize;
-    let mut dirs_created = 0usize;
-    let mut symlinks_created = 0usize;
-    let mut bytes_total_planned: u64 = planned.iter().map(|e| e.uncompressed_size).sum();
-    if bytes_total_planned == 0 {
-        bytes_total_planned = 1;
-    }
-
-    // Track archive-declared symlinks and defer creation until phase 2.
-    struct PendingSymlink {
-        link_rel: PathBuf,
-        target: String,
-        mtime: Option<i64>,
-    }
-    let mut pending_symlinks: Vec<PendingSymlink> = Vec::new();
-    let mut symlink_paths_lower: HashSet<String> = HashSet::new();
-
-    // Pre-pass: read & validate all symlink entries BEFORE creating any regular files,
-    // blocking absolute targets, root escapes, symlink-ancestor writes, and multi-hop chaining.
-    let mut prevalidated_symlinks: Vec<(PathBuf, String)> = Vec::new();
-    for entry in &planned {
-        if entry.kind != EntryKind::Symlink {
-            continue;
-        }
-        opts.cancel.check()?;
-        let sanitized = sanitize_entry_path(&entry.decoded_path, opts.path_policy)?;
-        let stripped = strip_root_prefix(&sanitized.normalized, plan.strip_prefix.as_deref());
-        let final_sanitized = sanitize_entry_path(&stripped, opts.path_policy)?;
-        let zf = open_zip_entry(
-            &mut archive,
-            entry.index,
-            entry.encrypted,
-            opts.password.as_deref(),
-        )?;
-        let mut target_bytes = Vec::new();
-        zf.take(8192).read_to_end(&mut target_bytes)?;
-        let target = String::from_utf8(target_bytes).map_err(|_| DandiError::UnsafeSymlink {
-            path: final_sanitized.normalized.clone(),
-            target: "<non-utf8>".to_string(),
-            reason: "symlink target is not valid UTF-8".to_string(),
-        })?;
-        validate_symlink_target(&plan.extract_root, &final_sanitized.relative, &target)?;
-        symlink_paths_lower.insert(final_sanitized.normalized.to_lowercase());
-        prevalidated_symlinks.push((final_sanitized.relative, target));
-    }
-    for (link_rel, target) in &prevalidated_symlinks {
-        check_symlink_chain_safe(link_rel, target, &symlink_paths_lower)?;
-    }
-
-    let mut read_buf = vec![0u8; STREAM_BUF_SIZE];
-    let mut deferred_dir_mtimes: Vec<(PathBuf, i64, Option<u32>)> = Vec::new();
-
-    for (done_idx, entry) in planned.iter().enumerate() {
-        opts.cancel.check()?;
-        let sanitized = sanitize_entry_path(&entry.decoded_path, opts.path_policy)?;
-        if sanitized.was_sanitized {
-            sanitized_paths += 1;
-        }
-        let effective_str = strip_root_prefix(&sanitized.normalized, plan.strip_prefix.as_deref());
-        if effective_str.is_empty() {
-            continue;
-        }
-        let eff_sanitized = sanitize_entry_path(&effective_str, opts.path_policy)?;
-
-        match entry.kind {
-            EntryKind::Directory => {
-                check_not_through_archive_symlink(&eff_sanitized.normalized, &symlink_paths_lower)?;
-                collisions.register_dir(&eff_sanitized.normalized);
-                let out_path = plan.extract_root.join(&eff_sanitized.relative);
-                ensure_no_symlink_ancestors(&plan.extract_root, &eff_sanitized.relative)?;
-                fs::create_dir_all(to_fs_path(&out_path))
-                    .map_err(|e| DandiError::io(&out_path, e))?;
-                dirs_created += 1;
-                if let Some(ts) = entry.mtime_unix_secs {
-                    deferred_dir_mtimes.push((out_path, ts, entry.unix_mode));
-                } else if let Some(mode) = entry.unix_mode {
-                    let _ = apply_unix_mode(&out_path, mode, true);
-                }
-            }
-            EntryKind::Symlink => {
-                let zf = open_zip_entry(
-                    &mut archive,
-                    entry.index,
-                    entry.encrypted,
-                    opts.password.as_deref(),
-                )?;
-                let mut target_bytes = Vec::new();
-                zf.take(8192).read_to_end(&mut target_bytes)?;
-                let target =
-                    String::from_utf8(target_bytes).map_err(|_| DandiError::UnsafeSymlink {
-                        path: eff_sanitized.normalized.clone(),
-                        target: "<non-utf8>".to_string(),
-                        reason: "symlink target is not valid UTF-8".to_string(),
-                    })?;
-                let resolved_rel = collisions.resolve_file(&eff_sanitized);
-                validate_symlink_target(&plan.extract_root, &resolved_rel, &target)?;
-                pending_symlinks.push(PendingSymlink {
-                    link_rel: resolved_rel,
-                    target,
-                    mtime: entry.mtime_unix_secs,
-                });
-            }
-            EntryKind::File => {
-                check_not_through_archive_symlink(&eff_sanitized.normalized, &symlink_paths_lower)?;
-                let resolved_rel = collisions.resolve_file(&eff_sanitized);
-                let out_path = plan.extract_root.join(&resolved_rel);
-                if let Some(parent_rel) = resolved_rel.parent() {
-                    if !parent_rel.as_os_str().is_empty() {
-                        ensure_no_symlink_ancestors(&plan.extract_root, parent_rel)?;
-                        let parent_abs = plan.extract_root.join(parent_rel);
-                        fs::create_dir_all(to_fs_path(&parent_abs))
-                            .map_err(|e| DandiError::io(&parent_abs, e))?;
-                    }
-                }
-                ensure_no_symlink_ancestors(&plan.extract_root, &resolved_rel)?;
-
-                let mut zf = open_zip_entry(
-                    &mut archive,
-                    entry.index,
-                    entry.encrypted,
-                    opts.password.as_deref(),
-                )?;
-                budget.note_live_entry_compressed(entry.compressed_size);
-
-                let fs_out = to_fs_path(&out_path);
-                let out_file = File::create(&fs_out).map_err(|e| DandiError::io(&out_path, e))?;
-                let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, out_file);
-                let mut entry_written = 0u64;
-
-                loop {
-                    opts.cancel.check()?;
-                    let n = match zf.read(&mut read_buf) {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = fs::remove_file(&fs_out);
-                            return Err(classify_zip_read_io_error(e));
-                        }
-                    };
-                    entry_written = entry_written.saturating_add(n as u64);
-                    budget.record_written_bytes(n as u64, entry_written, entry.compressed_size)?;
-                    writer.write_all(&read_buf[..n])?;
-                }
-                writer.flush()?;
-                drop(writer);
-
-                if let Some(mode) = entry.unix_mode {
-                    let _ = apply_unix_mode(&out_path, mode, false);
-                }
-                if let Some(ts) = entry.mtime_unix_secs {
-                    let _ = set_mtime(&out_path, ts, false);
-                }
-                if let Some(ref zdata) = zone_data {
-                    let _ = write_zone_identifier(&out_path, zdata);
-                }
-                files_extracted += 1;
-            }
-        }
-
-        observer.on_progress(&ProgressEvent {
-            phase: ProgressPhase::Unpacking,
-            current_entry: eff_sanitized.normalized,
-            entries_done: done_idx + 1,
-            entries_total: planned.len(),
-            bytes_done: budget.bytes_written(),
-            bytes_total: bytes_total_planned,
-        });
-    }
-
-    // Phase 2: materialize validated safe relative symlinks.
-    for sym in pending_symlinks {
-        opts.cancel.check()?;
-        check_symlink_chain_safe(&sym.link_rel, &sym.target, &symlink_paths_lower)?;
-        ensure_no_symlink_ancestors(&plan.extract_root, &sym.link_rel)?;
-        let abs_link = plan.extract_root.join(&sym.link_rel);
-        if let Some(parent) = abs_link.parent() {
-            fs::create_dir_all(to_fs_path(parent)).map_err(|e| DandiError::io(parent, e))?;
-        }
-        let target_resolved =
-            validate_symlink_target(&plan.extract_root, &sym.link_rel, &sym.target)?;
-        let target_is_dir = to_fs_path(&target_resolved).is_dir();
-        create_relative_symlink(&abs_link, &sym.target, target_is_dir)
-            .map_err(|e| DandiError::io(&abs_link, e))?;
-        if let Some(ts) = sym.mtime {
-            let _ = set_mtime(&abs_link, ts, true);
-        }
-        symlinks_created += 1;
-    }
-
-    // Apply directory permissions and mtimes bottom-up so child writes don't clobber parent mtimes.
-    for (dir_path, ts, mode) in deferred_dir_mtimes.into_iter().rev() {
-        let _ = set_mtime(&dir_path, ts, false);
-        if let Some(m) = mode {
-            let _ = apply_unix_mode(&dir_path, m, true);
-        }
-    }
-
-    dir_guard.disarm();
-
-    observer.on_progress(&ProgressEvent {
-        phase: ProgressPhase::Finalizing,
-        current_entry: plan.reported_output_dir.display().to_string(),
-        entries_done: planned.len(),
-        entries_total: planned.len(),
-        bytes_done: budget.bytes_written(),
-        bytes_total: bytes_total_planned,
-    });
-
-    Ok(UnpackReport {
-        format: ArchiveFormat::Zip,
-        output_dir: plan.reported_output_dir,
-        detected_encoding: detection.encoding,
-        applied_encoding,
-        files_extracted,
-        dirs_created,
-        symlinks_created,
-        junk_skipped,
-        bytes_written: budget.bytes_written(),
-        sanitized_paths,
-        renamed_collisions: collisions.into_renames(),
-    })
-}
-
-fn strip_root_prefix(normalized: &str, prefix: Option<&str>) -> String {
-    match prefix {
-        Some(p) => {
-            if normalized == p {
-                String::new()
-            } else if let Some(rest) = normalized.strip_prefix(&format!("{p}/")) {
-                rest.to_string()
-            } else {
-                normalized.to_string()
-            }
-        }
-        None => normalized.to_string(),
-    }
-}
-
-fn open_zip_entry<'a, R: Read + Seek>(
-    archive: &'a mut ZipArchive<R>,
-    index: usize,
-    encrypted: bool,
-    password: Option<&str>,
-) -> Result<zip::read::ZipFile<'a, R>> {
-    if !encrypted {
-        return archive.by_index(index).map_err(map_zip_error);
-    }
-
-    let pw = password.ok_or(DandiError::PasswordRequired)?;
-    let pw_nfc: String = pw.nfc().collect();
-
-    // Try UTF-8 NFC password first; if raw password differs (e.g. legacy NFD), probe before opening.
-    if pw_nfc != pw {
-        let nfc_ok = archive.by_index_decrypt(index, pw_nfc.as_bytes()).is_ok();
-        if nfc_ok {
-            return archive
-                .by_index_decrypt(index, pw_nfc.as_bytes())
-                .map_err(map_zip_error);
-        }
-        return archive
-            .by_index_decrypt(index, pw.as_bytes())
-            .map_err(map_zip_error);
-    }
-
-    archive
-        .by_index_decrypt(index, pw_nfc.as_bytes())
-        .map_err(map_zip_error)
-}
-
-fn map_zip_error(err: zip::result::ZipError) -> DandiError {
-    match err {
-        zip::result::ZipError::InvalidPassword => DandiError::InvalidPassword,
-        zip::result::ZipError::UnsupportedArchive(msg) => {
-            if msg.to_ascii_lowercase().contains("password") {
-                DandiError::PasswordRequired
-            } else {
-                DandiError::CorruptArchive(msg.to_string())
-            }
-        }
-        zip::result::ZipError::InvalidArchive(msg) => DandiError::CorruptArchive(msg.to_string()),
-        zip::result::ZipError::Io(e) => classify_zip_read_io_error(e),
-        other => DandiError::CorruptArchive(other.to_string()),
-    }
-}
-
-fn classify_zip_read_io_error(err: io::Error) -> DandiError {
-    let msg = err.to_string();
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("invalid password") || lower.contains("authentication") {
-        DandiError::InvalidPassword
-    } else if err.kind() == io::ErrorKind::InvalidData
-        || err.kind() == io::ErrorKind::UnexpectedEof
-        || lower.contains("crc")
-        || lower.contains("corrupt")
-    {
-        DandiError::CorruptArchive(msg)
-    } else {
-        DandiError::io_plain(err)
-    }
-}
-
 pub(crate) fn repack_zip_nfc(
     src_zip: &Path,
     dst_zip: &Path,
@@ -2079,10 +1172,9 @@ pub(crate) fn repack_zip_nfc(
 ) -> Result<RepackReport> {
     opts.cancel.check()?;
     if to_fs_path(dst_zip).exists() && !opts.overwrite {
-        return Err(DandiError::InvalidInput(format!(
-            "destination already exists: {}",
-            dst_zip.display()
-        )));
+        return Err(DandiError::AlreadyExists {
+            path: dst_zip.to_path_buf(),
+        });
     }
     if let Some(parent) = dst_zip.parent() {
         if !parent.as_os_str().is_empty() {
@@ -2234,6 +1326,7 @@ pub(crate) fn repack_zip_nfc(
     }
 
     let (output_bytes, _) = writer.finish()?;
+    drop(archive);
     commit_temp_file(&tmp_path, dst_zip, opts.overwrite)?;
     guard.disarm();
 
@@ -2246,25 +1339,61 @@ pub(crate) fn repack_zip_nfc(
     })
 }
 
-fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16> {
-    let slice = buf
-        .get(offset..offset + 2)
-        .ok_or_else(|| DandiError::CorruptArchive("unexpected EOF reading u16".to_string()))?;
-    Ok(u16::from_le_bytes([slice[0], slice[1]]))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::zip::header::inspect_zip_raw_headers;
+    use crate::archive::{unpack, ExtractMode, UnpackOptions};
+    use crate::progress::NoopProgressObserver;
+    use tempfile::TempDir;
 
-fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
-    let slice = buf
-        .get(offset..offset + 4)
-        .ok_or_else(|| DandiError::CorruptArchive("unexpected EOF reading u32".to_string()))?;
-    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
-}
+    #[test]
+    fn repack_nfc_in_place_succeeds_when_src_equals_dst() {
+        let tmp = TempDir::new().unwrap();
+        let src_dir = tmp.path().join("in_place_src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let file_name = "가나다_테스트.txt";
+        let payload = b"in-place repack payload";
+        fs::write(src_dir.join(file_name), payload).unwrap();
 
-fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
-    let slice = buf
-        .get(offset..offset + 8)
-        .ok_or_else(|| DandiError::CorruptArchive("unexpected EOF reading u64".to_string()))?;
-    Ok(u64::from_le_bytes([
-        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-    ]))
+        let zip_path = tmp.path().join("same.zip");
+        pack_zip(
+            &[src_dir],
+            &zip_path,
+            &PackOptions::default(),
+            &NoopProgressObserver,
+        )
+        .unwrap();
+
+        // Repack directly in-place (src_zip == dst_zip); must not fail with Windows sharing violation.
+        let report = repack_zip_nfc(
+            &zip_path,
+            &zip_path,
+            &RepackOptions::default(),
+            &NoopProgressObserver,
+        )
+        .unwrap();
+        assert_eq!(report.output_path, zip_path);
+        assert!(report.entries_repacked >= 1);
+
+        let headers = inspect_zip_raw_headers(&zip_path).unwrap();
+        assert!(!headers.is_empty());
+        assert!(headers.iter().all(|h| h.utf8_bit11()));
+
+        let out_dir = tmp.path().join("out");
+        unpack(
+            &zip_path,
+            &out_dir,
+            &UnpackOptions {
+                mode: ExtractMode::Direct,
+                ..UnpackOptions::default()
+            },
+            &NoopProgressObserver,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(out_dir.join("in_place_src").join(file_name)).unwrap(),
+            payload
+        );
+    }
 }
